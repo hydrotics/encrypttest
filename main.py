@@ -36,9 +36,9 @@ BOOSTER_ROLE_ID = int(os.getenv("BOOSTER_ROLE_ID", "0") or 0)
 MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "2"))
 PENDING_UPLOAD_TIMEOUT = int(os.getenv("PENDING_UPLOAD_TIMEOUT", "300"))
 MAX_VIDEO_SECONDS = int(os.getenv("MAX_VIDEO_SECONDS", "300"))
-MAX_VIDEO_HEIGHT = int(os.getenv("MAX_VIDEO_HEIGHT", "1080"))
-VIDEO_CRF = int(os.getenv("VIDEO_CRF", "20"))
-VIDEO_PRESET = os.getenv("VIDEO_PRESET", "medium")
+MAX_VIDEO_HEIGHT = int(os.getenv("MAX_VIDEO_HEIGHT", "720"))
+VIDEO_CRF = int(os.getenv("VIDEO_CRF", "24"))
+VIDEO_PRESET = os.getenv("VIDEO_PRESET", "veryfast")
 DELETE_UPLOAD_MESSAGE = os.getenv("DELETE_UPLOAD_MESSAGE", "true").lower() == "true"
 IMAGE_AMP = float(os.getenv("WM_IMAGE_AMP", "3.0"))
 IMAGE_CELL = int(os.getenv("WM_IMAGE_CELL", "4"))
@@ -76,6 +76,7 @@ log = logging.getLogger("revealbot")
 PROCESS_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 USER_LOCKS: dict[tuple[str, int], asyncio.Lock] = defaultdict(asyncio.Lock)
 PENDING_UPLOADS: dict[tuple[int, int, int], float] = {}
+PENDING_SWEEP_INTERVAL = 60
 
 
 def safe_json_write(path: Path, payload: dict) -> None:
@@ -138,13 +139,17 @@ def ledger_served(reveal_id: str, user_id: int) -> bool:
     if not LEDGER_FILE.exists():
         return False
     try:
-        return any(
-            (row := json.loads(line))["reveal_id"] == reveal_id and row["user_id"] == user_id
-            for line in LEDGER_FILE.read_text(encoding="utf-8").splitlines()
-        )
-    except Exception:
+        with LEDGER_FILE.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if row.get("reveal_id") == reveal_id and row.get("user_id") == user_id:
+                    return True
+    except OSError:
         log.exception("Could not read ledger.")
-        return False
+    return False
 
 
 def _build_sync(source: Path, kind: str, output: Path, user_id: int, reveal_id: str) -> None:
@@ -227,6 +232,15 @@ async def build_personalized_reveal(user_id: int) -> tuple[Path, Optional[Path]]
                     temp_preview.unlink(missing_ok=True)
 
     return output, preview
+
+
+async def pending_upload_sweeper() -> None:
+    while True:
+        await asyncio.sleep(PENDING_SWEEP_INTERVAL)
+        now = time.monotonic()
+        for key, expiry in list(PENDING_UPLOADS.items()):
+            if expiry <= now:
+                PENDING_UPLOADS.pop(key, None)
 
 
 async def health_handler(_: web.Request) -> web.Response:
@@ -446,7 +460,7 @@ async def view_reveal(interaction: discord.Interaction):
                 return
             await interaction.followup.send(
                 "Here is your personalized reveal. It is uniquely marked to you — please don't share it.",
-                file=discord.File(str(personalized), filename=personalized.name), ephemeral=True)
+                file=discord.File(str(personalized), filename="personalized-reveal.mp4"), ephemeral=True)
 
         ledger_append(reveal_id, member.id)
         log.info("Served reveal_id=%s to user_id=%s size=%d", reveal_id, member.id, size_bytes)
@@ -527,10 +541,13 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
 async def main():
     http_runner = await start_http_server()
+    sweeper = asyncio.create_task(pending_upload_sweeper(), name="pending-upload-sweeper")
     try:
         async with bot:
             await bot.start(TOKEN)
     finally:
+        sweeper.cancel()
+        await asyncio.gather(sweeper, return_exceptions=True)
         await http_runner.cleanup()
 
 
