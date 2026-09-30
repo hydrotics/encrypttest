@@ -433,12 +433,14 @@ def _video_duration_seconds(src: Path) -> float:
 
 
 def _adaptive_video_height(source_height: int, duration: float, requested_max: int) -> int:
-    """Keep long videos sharp per bit instead of squeezing 720p into a tiny bitrate."""
+    """Preserve source resolution up to the configured delivery ceiling.
+
+    We no longer reduce resolution merely because a clip is long: external streaming
+    delivery is not constrained by Discord's attachment-size limit, and the old duration
+    caps were a direct source of visibly soft/blurry long videos.
+    """
+    del duration
     ceiling = min(int(source_height), int(requested_max))
-    if duration > 180:
-        ceiling = min(ceiling, 480)
-    elif duration > 90:
-        ceiling = min(ceiling, 576)
     return max(144, ceiling)
 
 
@@ -475,15 +477,20 @@ def embed_video(src: Path, dst: Path, user_id: int, key: bytes, reveal_id: str, 
     audio_bps = max(64000, min(128000, int(audio_kbps) * 1000))
     dst.parent.mkdir(parents=True, exist_ok=True)
 
-    # Approximate the allowed video bitrate. The CRF encode is still quality driven;
-    # maxrate/bufsize act as the delivery guardrail. Leave ~7% for audio/container overhead.
-    maxrate = 4_500_000
+    # CRF drives quality. When an attachment-size target is required (local/fallback
+    # delivery), maxrate is derived from that target. For external streaming, allow a
+    # substantially larger bitrate so the personalized video does not look soft.
     if target:
         usable_bits = max(1, int(target * 8 * 0.91) - int(audio_bps * duration))
-        maxrate = int(max(350_000, min(6_000_000, usable_bits / max(duration, 1.0))))
-        # Avoid starving short clips; the file-size check below can lower CRF if needed.
-        maxrate = max(700_000, maxrate)
-    bufsize = max(700_000, maxrate * 2)
+        maxrate = int(max(700_000, min(6_000_000, usable_bits / max(duration, 1.0))))
+    else:
+        if h >= 900:
+            maxrate = 10_000_000
+        elif h >= 700:
+            maxrate = 7_000_000
+        else:
+            maxrate = 4_500_000
+    bufsize = max(1_400_000, maxrate * 2)
 
     def encode_once(out_path: Path, pass_crf: int, pass_height: int, pass_maxrate: int) -> int:
         pw, ph, pfps, pvf = _probe_video(src, pass_height)
@@ -495,10 +502,10 @@ def embed_video(src: Path, dst: Path, user_id: int, key: bytes, reveal_id: str, 
                 "-framerate", f"{pfps:.6f}", "-i", "-",
                 "-i", str(src),
                 "-map", "0:v:0", "-map", "1:a:0?",
-                "-c:v", "libx264", "-preset", preset, "-tune", "fastdecode",
+                "-c:v", "libx264", "-preset", preset,
                 "-crf", str(pass_crf), "-maxrate", str(pass_maxrate),
-                "-bufsize", str(max(pass_maxrate * 2, 700_000)),
-                "-profile:v", "baseline", "-level", "3.1",
+                "-bufsize", str(max(pass_maxrate * 2, 1_400_000)),
+                "-profile:v", "main", "-level", "4.0",
                 "-pix_fmt", "yuv420p", "-bf", "0", "-refs", "1",
                 "-g", str(gop), "-keyint_min", str(max(30, gop // 2)), "-sc_threshold", "40",
                 "-tag:v", "avc1",
