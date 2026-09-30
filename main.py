@@ -1,7 +1,11 @@
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
+import mimetypes
 import os
+import re
 import secrets
 import shutil
 import time
@@ -9,10 +13,12 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
+from aiohttp import web
 import discord
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
+from PIL import Image, ImageOps
 import watermark as wm
 
 load_dotenv()
@@ -40,6 +46,17 @@ VIDEO_AMP = float(os.getenv("WM_VIDEO_AMP", "3.0"))
 VIDEO_CELL = int(os.getenv("WM_VIDEO_CELL", "8"))
 KEEP_ORIGINALS = os.getenv("KEEP_ORIGINALS", "true").lower() == "true"
 
+# Render Web Service / health endpoint.
+# Render supplies PORT and RENDER_EXTERNAL_URL automatically for web services.
+HTTP_HOST = "0.0.0.0"
+HTTP_PORT = int(os.getenv("PORT", "10000"))
+PUBLIC_URL = (os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
+
+# The Discord client benefits from a smaller, baseline JPEG for the mobile preview.
+# The original personalized image is still kept and exposed as the full-resolution link.
+IMAGE_PREVIEW_MAX_DIM = int(os.getenv("IMAGE_PREVIEW_MAX_DIM", "2048"))
+IMAGE_PREVIEW_QUALITY = int(os.getenv("IMAGE_PREVIEW_QUALITY", "88"))
+
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 REVEALS_DIR = DATA_DIR / "reveals"
 CACHE_DIR = DATA_DIR / "cache"
@@ -51,6 +68,7 @@ for directory in (REVEALS_DIR, CACHE_DIR, TMP_DIR):
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"}
+REVEAL_ID_RE = re.compile(r"^\d+_[0-9a-f]{8}$")
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
@@ -138,7 +156,35 @@ def _build_sync(source: Path, kind: str, output: Path, user_id: int, reveal_id: 
                        max_height=MAX_VIDEO_HEIGHT)
 
 
-async def build_personalized_reveal(user_id: int) -> Path:
+def _build_mobile_preview_sync(personalized: Path, preview: Path) -> None:
+    """Create a small baseline JPEG used for fast Discord/mobile display."""
+    with Image.open(personalized) as im:
+        im = ImageOps.exif_transpose(im).convert("RGB")
+        im.thumbnail((IMAGE_PREVIEW_MAX_DIM, IMAGE_PREVIEW_MAX_DIM), Image.Resampling.LANCZOS)
+        preview.parent.mkdir(parents=True, exist_ok=True)
+        im.save(
+            preview,
+            "JPEG",
+            quality=max(70, min(95, IMAGE_PREVIEW_QUALITY)),
+            optimize=True,
+            progressive=False,
+            subsampling=2,
+        )
+
+
+def media_token(reveal_id: str, user_id: int) -> str:
+    payload = f"media:{reveal_id}:{int(user_id)}".encode("utf-8")
+    return hmac.new(WM_KEY, payload, hashlib.sha256).hexdigest()
+
+
+def _media_url(reveal_id: str, user_id: int, variant: str = "preview") -> Optional[str]:
+    if not PUBLIC_URL:
+        return None
+    token = media_token(reveal_id, user_id)
+    return f"{PUBLIC_URL}/media/{reveal_id}/{int(user_id)}/{token}?v={variant}"
+
+
+async def build_personalized_reveal(user_id: int) -> tuple[Path, Optional[Path]]:
     reveal = CURRENT_REVEAL
     if not reveal or not Path(reveal["path"]).exists():
         raise RuntimeError("There is currently no valid reveal.")
@@ -149,19 +195,105 @@ async def build_personalized_reveal(user_id: int) -> Path:
     cache_dir.mkdir(parents=True, exist_ok=True)
     suffix = ".mp4" if kind == "video" else (source.suffix.lower() if source.suffix.lower() in IMAGE_EXTS else ".png")
     output = cache_dir / f"user_{user_id}{suffix}"
-    if output.exists() and output.stat().st_size > 0:
-        return output
+    preview = cache_dir / f"user_{user_id}_mobile.jpg" if kind == "image" else None
+
+    needs_output = not output.exists() or output.stat().st_size <= 0
+    needs_preview = preview is not None and (not preview.exists() or preview.stat().st_size <= 0)
+
+    if not needs_output and not needs_preview:
+        return output, preview
+
     async with USER_LOCKS[(reveal_id, user_id)]:
-        if output.exists() and output.stat().st_size > 0:
-            return output
+        needs_output = not output.exists() or output.stat().st_size <= 0
+        needs_preview = preview is not None and (not preview.exists() or preview.stat().st_size <= 0)
+        if not needs_output and not needs_preview:
+            return output, preview
+
         async with PROCESS_SEMAPHORE:
-            temp_output = output.with_name(f"{output.stem}.tmp{output.suffix}")
-            try:
-                await asyncio.to_thread(_build_sync, source, kind, temp_output, user_id, reveal_id)
-                temp_output.replace(output)
-            finally:
-                temp_output.unlink(missing_ok=True)
-    return output
+            if needs_output:
+                temp_output = output.with_name(f"{output.stem}.tmp{output.suffix}")
+                try:
+                    await asyncio.to_thread(_build_sync, source, kind, temp_output, user_id, reveal_id)
+                    temp_output.replace(output)
+                finally:
+                    temp_output.unlink(missing_ok=True)
+
+            if preview is not None and (not preview.exists() or preview.stat().st_size <= 0):
+                temp_preview = preview.with_name(f"{preview.stem}.tmp{preview.suffix}")
+                try:
+                    await asyncio.to_thread(_build_mobile_preview_sync, output, temp_preview)
+                    temp_preview.replace(preview)
+                finally:
+                    temp_preview.unlink(missing_ok=True)
+
+    return output, preview
+
+
+async def health_handler(_: web.Request) -> web.Response:
+    return web.json_response({
+        "status": "ok",
+        "discord_ready": bot.is_ready() if "bot" in globals() else False,
+        "service": "revealbot",
+    })
+
+
+async def media_handler(request: web.Request) -> web.StreamResponse:
+    reveal_id = request.match_info["reveal_id"]
+    raw_user_id = request.match_info["user_id"]
+    token = request.match_info["token"]
+
+    if not REVEAL_ID_RE.fullmatch(reveal_id):
+        raise web.HTTPNotFound()
+    try:
+        user_id = int(raw_user_id)
+    except ValueError:
+        raise web.HTTPNotFound()
+
+    expected = media_token(reveal_id, user_id)
+    if not hmac.compare_digest(token, expected):
+        raise web.HTTPNotFound()
+
+    reveal = find_reveal(reveal_id)
+    if not reveal or reveal["kind"] != "image":
+        raise web.HTTPNotFound()
+
+    source_suffix = Path(reveal["path"]).suffix.lower()
+    if source_suffix not in IMAGE_EXTS:
+        source_suffix = ".png"
+
+    original = CACHE_DIR / reveal_id / f"user_{user_id}{source_suffix}"
+    preview = CACHE_DIR / reveal_id / f"user_{user_id}_mobile.jpg"
+    variant = request.query.get("v", "preview").lower()
+    if variant not in {"preview", "original"}:
+        raise web.HTTPNotFound()
+
+    path = preview if variant == "preview" else original
+    if not path.exists() or path.stat().st_size <= 0:
+        raise web.HTTPNotFound()
+
+    content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    response = web.FileResponse(path, headers={
+        "Content-Type": content_type,
+        "Content-Disposition": f'inline; filename="{path.name}"',
+        "Cache-Control": "public, max-age=31536000, immutable",
+        "X-Content-Type-Options": "nosniff",
+    })
+    return response
+
+
+async def start_http_server() -> web.AppRunner:
+    app = web.Application()
+    app.router.add_get("/", health_handler)
+    app.router.add_get("/health", health_handler)
+    app.router.add_get("/media/{reveal_id}/{user_id}/{token}", media_handler)
+
+    runner = web.AppRunner(app, access_log=log)
+    await runner.setup()
+    site = web.TCPSite(runner, HTTP_HOST, HTTP_PORT)
+    await site.start()
+    log.info("HTTP server listening on %s:%d (public URL: %s)", HTTP_HOST, HTTP_PORT,
+             PUBLIC_URL or "not configured")
+    return runner
 
 
 def clear_old_cache(keep_reveal_id: str) -> None:
@@ -289,21 +421,44 @@ async def view_reveal(interaction: discord.Interaction):
         return
     await interaction.response.defer(ephemeral=True, thinking=True)
     try:
-        personalized = await build_personalized_reveal(member.id)
+        personalized, preview = await build_personalized_reveal(member.id)
         guild_limit = getattr(interaction.guild, "filesize_limit", None)
         size_bytes = personalized.stat().st_size
-        if guild_limit and size_bytes > guild_limit:
+        reveal_id = CURRENT_REVEAL["reveal_id"]
+
+        # Images are served through our Render HTTPS endpoint inside a Discord embed.
+        # This avoids forcing Discord mobile to upload/download the large source file
+        # as an attachment before it can display it.
+        preview_url = _media_url(reveal_id, member.id, "preview")
+        original_url = _media_url(reveal_id, member.id, "original")
+        if preview is not None and preview_url and original_url:
+            embed = discord.Embed(
+                title="Your personalized reveal",
+                description="The preview is optimized for fast mobile loading. The full-resolution image is linked below.",
+            )
+            embed.set_image(url=preview_url)
             await interaction.followup.send(
-                f"❌ The personalized file is too large for this server's upload limit "
-                f"({size_bytes / 1048576:.1f} MB vs {guild_limit / 1048576:.1f} MB).",
+                content=(
+                    "Here is your personalized reveal. It is uniquely marked to you — please don't share it.\n"
+                    f"[Open full-resolution image]({original_url})"
+                ),
+                embed=embed,
                 ephemeral=True,
             )
-            return
-        await interaction.followup.send(
-            "Here is your personalized reveal. It is uniquely marked to you — please don't share it.",
-            file=discord.File(str(personalized), filename=personalized.name), ephemeral=True)
-        ledger_append(CURRENT_REVEAL["reveal_id"], member.id)
-        log.info("Served reveal_id=%s to user_id=%s size=%d", CURRENT_REVEAL["reveal_id"], member.id, size_bytes)
+        else:
+            if guild_limit and size_bytes > guild_limit:
+                await interaction.followup.send(
+                    f"❌ The personalized file is too large for this server's upload limit "
+                    f"({size_bytes / 1048576:.1f} MB vs {guild_limit / 1048576:.1f} MB).",
+                    ephemeral=True,
+                )
+                return
+            await interaction.followup.send(
+                "Here is your personalized reveal. It is uniquely marked to you — please don't share it.",
+                file=discord.File(str(personalized), filename=personalized.name), ephemeral=True)
+
+        ledger_append(reveal_id, member.id)
+        log.info("Served reveal_id=%s to user_id=%s size=%d", reveal_id, member.id, size_bytes)
     except Exception:
         log.exception("Failed to build/send personalized reveal.")
         await interaction.followup.send("❌ I couldn't generate your personalized reveal.", ephemeral=True)
@@ -380,8 +535,12 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
 
 async def main():
-    async with bot:
-        await bot.start(TOKEN)
+    http_runner = await start_http_server()
+    try:
+        async with bot:
+            await bot.start(TOKEN)
+    finally:
+        await http_runner.cleanup()
 
 
 if __name__ == "__main__":
