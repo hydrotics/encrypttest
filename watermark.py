@@ -417,15 +417,15 @@ def _iter_frames(src: Path, vf: str, w: int, h: int, *, skip: int = 0,
 
 
 def embed_video(src: Path, dst: Path, user_id: int, key: bytes, reveal_id: str, *,
-                amp: float = AMP, cell: int = CELL, crf: int = 24, preset: str = "veryfast",
+                amp: float = AMP, cell: int = CELL, crf: int = 20, preset: str = "superfast",
                 max_seconds: int = 300, max_height: int = 720, group: int = VIDEO_GROUP) -> None:
-    """Embed watermark and output a mobile-compatible, fast-start MP4."""
+    """Embed watermark and output a higher-quality mobile-compatible, fast-start MP4."""
     del cell
     w, h, fps, vf = _probe_video(src, max_height)
     bits = encode_payload(user_id)
     ff = get_ffmpeg()
-    gop = max(15, int(round(fps * 2.0)))
-    maxrate = 2_500_000 if h <= 720 else 5_000_000
+    gop = max(30, int(round(fps * 2.0)))
+    maxrate = 5_500_000 if h <= 720 else 9_000_000
     bufsize = maxrate * 2
     duration = max(1, int(max_seconds))
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -439,12 +439,12 @@ def embed_video(src: Path, dst: Path, user_id: int, key: bytes, reveal_id: str, 
             "-i", str(src),
             "-map", "0:v:0", "-map", "1:a:0?",
             "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
-            "-profile:v", "baseline", "-level", "3.1" if h <= 720 else "4.0",
-            "-pix_fmt", "yuv420p", "-bf", "0",
+            "-profile:v", "main", "-level", "3.1" if h <= 720 else "4.0",
+            "-pix_fmt", "yuv420p", "-bf", "2",
             "-g", str(gop), "-keyint_min", str(gop), "-sc_threshold", "40",
             "-maxrate", str(maxrate), "-bufsize", str(bufsize),
             "-tag:v", "avc1",
-            "-c:a", "aac", "-b:a", "96k", "-ar", "48000", "-ac", "2",
+            "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
             "-map_metadata", "-1", "-map_chapters", "-1", "-sn", "-dn",
             "-movflags", "+faststart", "-t", str(duration), "-shortest", str(dst),
         ],
@@ -453,11 +453,16 @@ def embed_video(src: Path, dst: Path, user_id: int, key: bytes, reveal_id: str, 
 
     frames = 0
     rc = 1
+    cached_group = -1
+    group_delta = None
     try:
         for i, buf in _iter_frames(src, vf, w, h, max_seconds=duration):
+            group_idx = i // max(1, group)
             y = np.frombuffer(buf, np.uint8, count=w * h).reshape(h, w)
-            delta = np.rint(_delta(y.astype(np.float32), bits, key, reveal_id, i // group, amp))
-            y[:] = np.clip(y.astype(np.int16) + delta, 0, 255).astype(np.uint8)
+            if group_idx != cached_group:
+                group_delta = np.rint(_delta(y.astype(np.float32), bits, key, reveal_id, group_idx, amp))
+                cached_group = group_idx
+            y[:] = np.clip(y.astype(np.int16) + group_delta, 0, 255).astype(np.uint8)
             try:
                 enc.stdin.write(buf)
             except BrokenPipeError:
@@ -467,7 +472,7 @@ def embed_video(src: Path, dst: Path, user_id: int, key: bytes, reveal_id: str, 
             enc.stdin.close()
         except BrokenPipeError:
             pass
-        rc = enc.wait(timeout=max(60, duration * 10))
+        rc = enc.wait(timeout=max(60, duration * 6))
     except subprocess.TimeoutExpired:
         enc.kill()
         enc.wait()
