@@ -37,8 +37,11 @@ MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "2"))
 PENDING_UPLOAD_TIMEOUT = int(os.getenv("PENDING_UPLOAD_TIMEOUT", "300"))
 MAX_VIDEO_SECONDS = int(os.getenv("MAX_VIDEO_SECONDS", "300"))
 MAX_VIDEO_HEIGHT = int(os.getenv("MAX_VIDEO_HEIGHT", "720"))
-VIDEO_CRF = int(os.getenv("VIDEO_CRF", "20"))
-VIDEO_PRESET = os.getenv("VIDEO_PRESET", "superfast")
+VIDEO_CRF = int(os.getenv("VIDEO_CRF", "19"))
+VIDEO_PRESET = os.getenv("VIDEO_PRESET", "veryfast")
+VIDEO_AUDIO_KBPS = int(os.getenv("VIDEO_AUDIO_KBPS", "96"))
+VIDEO_TARGET_MAX_MB = float(os.getenv("VIDEO_TARGET_MAX_MB", "18.0"))
+VIDEO_CACHE_VERSION = os.getenv("VIDEO_CACHE_VERSION", "v4")
 DELETE_UPLOAD_MESSAGE = os.getenv("DELETE_UPLOAD_MESSAGE", "true").lower() == "true"
 IMAGE_AMP = float(os.getenv("WM_IMAGE_AMP", "3.0"))
 IMAGE_CELL = int(os.getenv("WM_IMAGE_CELL", "4"))
@@ -152,13 +155,17 @@ def ledger_served(reveal_id: str, user_id: int) -> bool:
     return False
 
 
-def _build_sync(source: Path, kind: str, output: Path, user_id: int, reveal_id: str) -> None:
+def _build_sync(source: Path, kind: str, output: Path, user_id: int, reveal_id: str,
+                target_bytes: Optional[int] = None) -> None:
     if kind == "image":
         wm.embed_image(source, output, user_id, WM_KEY, reveal_id, amp=IMAGE_AMP, cell=IMAGE_CELL)
     else:
-        wm.embed_video(source, output, user_id, WM_KEY, reveal_id, amp=VIDEO_AMP, cell=VIDEO_CELL,
-                       crf=VIDEO_CRF, preset=VIDEO_PRESET, max_seconds=MAX_VIDEO_SECONDS,
-                       max_height=MAX_VIDEO_HEIGHT)
+        wm.embed_video(
+            source, output, user_id, WM_KEY, reveal_id, amp=VIDEO_AMP, cell=VIDEO_CELL,
+            crf=VIDEO_CRF, preset=VIDEO_PRESET, max_seconds=MAX_VIDEO_SECONDS,
+            max_height=MAX_VIDEO_HEIGHT, target_bytes=target_bytes,
+            audio_kbps=VIDEO_AUDIO_KBPS,
+        )
 
 
 def _build_mobile_preview_sync(personalized: Path, preview: Path) -> None:
@@ -189,7 +196,7 @@ def _media_url(reveal_id: str, user_id: int, variant: str = "preview") -> Option
     return f"{PUBLIC_URL}/media/{reveal_id}/{int(user_id)}/{token}?v={variant}"
 
 
-async def build_personalized_reveal(user_id: int) -> tuple[Path, Optional[Path]]:
+async def build_personalized_reveal(user_id: int, *, video_target_bytes: Optional[int] = None) -> tuple[Path, Optional[Path]]:
     reveal = CURRENT_REVEAL
     if not reveal or not Path(reveal["path"]).exists():
         raise RuntimeError("There is currently no valid reveal.")
@@ -199,7 +206,11 @@ async def build_personalized_reveal(user_id: int) -> tuple[Path, Optional[Path]]
     cache_dir = CACHE_DIR / reveal_id
     cache_dir.mkdir(parents=True, exist_ok=True)
     suffix = ".mp4" if kind == "video" else (source.suffix.lower() if source.suffix.lower() in IMAGE_EXTS else ".png")
-    output = cache_dir / f"user_{user_id}{suffix}"
+    if kind == "video":
+        target_mb = int(round((video_target_bytes or (VIDEO_TARGET_MAX_MB * 1048576)) / 1048576))
+        output = cache_dir / f"user_{user_id}_{VIDEO_CACHE_VERSION}_{target_mb}mb.mp4"
+    else:
+        output = cache_dir / f"user_{user_id}{suffix}"
     preview = cache_dir / f"user_{user_id}_mobile.jpg" if kind == "image" else None
 
     needs_output = not output.exists() or output.stat().st_size <= 0
@@ -218,7 +229,9 @@ async def build_personalized_reveal(user_id: int) -> tuple[Path, Optional[Path]]
             if needs_output:
                 temp_output = output.with_name(f"{output.stem}.tmp{output.suffix}")
                 try:
-                    await asyncio.to_thread(_build_sync, source, kind, temp_output, user_id, reveal_id)
+                    await asyncio.to_thread(
+                        _build_sync, source, kind, temp_output, user_id, reveal_id, video_target_bytes
+                    )
                     temp_output.replace(output)
                 finally:
                     temp_output.unlink(missing_ok=True)
@@ -435,8 +448,17 @@ async def view_reveal(interaction: discord.Interaction):
         return
     await interaction.response.defer(ephemeral=True, thinking=True)
     try:
-        personalized, preview = await build_personalized_reveal(member.id)
+        interaction_limit = getattr(interaction, "filesize_limit", None)
         guild_limit = getattr(interaction.guild, "filesize_limit", None)
+        upload_limit = interaction_limit or guild_limit
+        video_target_bytes = None
+        if CURRENT_REVEAL["kind"] == "video":
+            configured_target = int(VIDEO_TARGET_MAX_MB * 1048576)
+            safe_limit = int(upload_limit * 0.90) if upload_limit else configured_target
+            video_target_bytes = max(2 * 1048576, min(configured_target, safe_limit))
+        personalized, preview = await build_personalized_reveal(
+            member.id, video_target_bytes=video_target_bytes
+        )
         size_bytes = personalized.stat().st_size
         reveal_id = CURRENT_REVEAL["reveal_id"]
 
@@ -451,10 +473,10 @@ async def view_reveal(interaction: discord.Interaction):
             # Videos are sent as a normal MP4 attachment so Discord's native mobile
             # player handles playback. The personalized video is encoded as H.264/AAC
             # with fast-start metadata and a lower CRF for cleaner playback.
-            if guild_limit and size_bytes > guild_limit:
+            if upload_limit and size_bytes > upload_limit:
                 await interaction.followup.send(
                     f"❌ The personalized file is too large for this server's upload limit "
-                    f"({size_bytes / 1048576:.1f} MB vs {guild_limit / 1048576:.1f} MB).",
+                    f"({size_bytes / 1048576:.1f} MB vs {upload_limit / 1048576:.1f} MB).",
                     ephemeral=True,
                 )
                 return
