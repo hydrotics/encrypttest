@@ -29,6 +29,7 @@ AMP = 4.0
 VIDEO_GROUP = 4
 MATCH_H = 360
 COARSE_H = 240
+VIDEO_MAX_FPS = 30.0
 
 _x, _y = np.mgrid[:CELL, :CELL].astype(np.float32)
 _CARRIER = (
@@ -348,19 +349,41 @@ def extract_image(orig: Path, leak: Path, key: bytes, reveal_id: str, cell: int 
 
 
 def _probe_video(src: Path, max_height: int):
+    """Probe and normalize video settings used by both embed and extraction."""
     ff = get_ffmpeg()
-    info = subprocess.run([ff, "-hide_banner", "-i", str(src)], capture_output=True, text=True).stderr
-    m = re.search(r"(\d+(?:\.\d+)?)\s*fps", info)
-    fps = min(max(float(m.group(1)), 1.0), 60.0) if m else 30.0
-    vf = f"fps={fps:.3f},scale=-2:trunc(min(ih\\,{max_height})/2)*2:flags=lanczos"
-    p = subprocess.run([ff, "-hide_banner", "-loglevel", "error", "-i", str(src), "-vf", vf,
-                       "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"], capture_output=True)
-    if not p.stdout:
-        raise RuntimeError("FFmpeg could not decode the video.")
-    with Image.open(io.BytesIO(p.stdout)) as im:
+    info = subprocess.run(
+        [ff, "-hide_banner", "-i", str(src)],
+        capture_output=True, text=True, timeout=30,
+    ).stderr
+    fps = None
+    for pattern in (
+        r"(\d+(?:\.\d+)?)(?:/(\d+(?:\.\d+)?))?\s*fps",
+        r"(\d+(?:\.\d+)?)\s*tbr",
+    ):
+        match = re.search(pattern, info)
+        if not match:
+            continue
+        numerator = float(match.group(1))
+        denominator = float(match.group(2)) if match.group(2) else 1.0
+        if numerator > 0 and denominator > 0:
+            fps = numerator / denominator
+            break
+    fps = min(max(fps or 30.0, 1.0), 60.0)
+    # Normalize high-FPS sources. The same normalized FPS is used when tracing.
+    fps = min(fps, VIDEO_MAX_FPS)
+    max_height = max(144, int(max_height))
+    vf = rf"fps={fps:.6f},scale=-2:trunc(min(ih\,{max_height})/2)*2:flags=lanczos"
+    probe = subprocess.run(
+        [ff, "-hide_banner", "-loglevel", "error", "-i", str(src), "-vf", vf,
+         "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"],
+        capture_output=True, timeout=45,
+    )
+    if not probe.stdout:
+        details = probe.stderr.decode("utf-8", "replace")[-1500:]
+        raise RuntimeError(f"FFmpeg could not decode the video. {details}".strip())
+    with Image.open(io.BytesIO(probe.stdout)) as im:
         w, h = im.size
     return w, h, fps, vf
-
 
 def _read_full(stream, buf) -> bool:
     view, got = memoryview(buf), 0
@@ -394,40 +417,72 @@ def _iter_frames(src: Path, vf: str, w: int, h: int, *, skip: int = 0,
 
 
 def embed_video(src: Path, dst: Path, user_id: int, key: bytes, reveal_id: str, *,
-                amp: float = AMP, cell: int = CELL, crf: int = 23, preset: str = "veryfast",
-                max_seconds: int = 300, max_height: int = 1080, group: int = VIDEO_GROUP) -> None:
+                amp: float = AMP, cell: int = CELL, crf: int = 24, preset: str = "veryfast",
+                max_seconds: int = 300, max_height: int = 720, group: int = VIDEO_GROUP) -> None:
+    """Embed watermark and output a mobile-compatible, fast-start MP4."""
     del cell
     w, h, fps, vf = _probe_video(src, max_height)
     bits = encode_payload(user_id)
     ff = get_ffmpeg()
+    gop = max(15, int(round(fps * 2.0)))
+    maxrate = 2_500_000 if h <= 720 else 5_000_000
+    bufsize = maxrate * 2
+    duration = max(1, int(max_seconds))
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
     err = tempfile.TemporaryFile()
     enc = subprocess.Popen(
-        [ff, "-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "yuv420p",
-         "-s", f"{w}x{h}", "-r", str(fps), "-i", "-", "-t", str(max_seconds), "-i", str(src),
-         "-map", "0:v:0", "-map", "1:a:0?", "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
-         "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", "-shortest", str(dst)],
-        stdin=subprocess.PIPE, stderr=err,
+        [
+            ff, "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", f"{w}x{h}",
+            "-framerate", str(fps), "-i", "-",
+            "-i", str(src),
+            "-map", "0:v:0", "-map", "1:a:0?",
+            "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
+            "-profile:v", "baseline", "-level", "3.1" if h <= 720 else "4.0",
+            "-pix_fmt", "yuv420p", "-bf", "0",
+            "-g", str(gop), "-keyint_min", str(gop), "-sc_threshold", "40",
+            "-maxrate", str(maxrate), "-bufsize", str(bufsize),
+            "-tag:v", "avc1",
+            "-c:a", "aac", "-b:a", "96k", "-ar", "48000", "-ac", "2",
+            "-map_metadata", "-1", "-map_chapters", "-1", "-sn", "-dn",
+            "-movflags", "+faststart", "-t", str(duration), "-shortest", str(dst),
+        ],
+        stdin=subprocess.PIPE, stderr=err, bufsize=1024 * 1024,
     )
+
     frames = 0
+    rc = 1
     try:
-        for i, buf in _iter_frames(src, vf, w, h, max_seconds=max_seconds):
+        for i, buf in _iter_frames(src, vf, w, h, max_seconds=duration):
             y = np.frombuffer(buf, np.uint8, count=w * h).reshape(h, w)
-            d = np.rint(_delta(y.astype(np.float32), bits, key, reveal_id, i // group, amp))
-            y[:] = np.clip(y.astype(np.int16) + d, 0, 255).astype(np.uint8)
-            enc.stdin.write(buf)
+            delta = np.rint(_delta(y.astype(np.float32), bits, key, reveal_id, i // group, amp))
+            y[:] = np.clip(y.astype(np.int16) + delta, 0, 255).astype(np.uint8)
+            try:
+                enc.stdin.write(buf)
+            except BrokenPipeError:
+                break
             frames += 1
-        enc.stdin.close()
-        rc = enc.wait()
-    except BrokenPipeError:
-        rc = enc.wait() or 1
+        try:
+            enc.stdin.close()
+        except BrokenPipeError:
+            pass
+        rc = enc.wait(timeout=max(60, duration * 10))
+    except subprocess.TimeoutExpired:
+        enc.kill()
+        enc.wait()
+        rc = 1
+        raise RuntimeError("FFmpeg video encode timed out.")
     finally:
         if enc.poll() is None:
-            enc.kill(); enc.wait()
-    if rc != 0 or frames == 0:
+            enc.kill()
+            enc.wait()
         err.seek(0)
-        raise RuntimeError("FFmpeg encode failed: " + err.read().decode("utf-8", "replace")[-3000:])
-    err.close()
+        error_text = err.read().decode("utf-8", "replace")[-3000:]
+        err.close()
 
+    if rc != 0 or frames == 0 or not dst.exists() or dst.stat().st_size <= 0:
+        raise RuntimeError("FFmpeg encode failed" + (f": {error_text}" if error_text else "."))
 
 def _decode_rgb_frame(buf: bytearray, w: int, h: int) -> np.ndarray:
     # yuv420p -> grayscale using Y plane; keeps extraction fast and stable.
@@ -445,19 +500,16 @@ def _coarse_frames(src: Path, max_height: int, sample_fps: float = 2.0,
     w, h, fps, vf = _probe_video(src, max_height)
     rate = min(max(sample_fps, .5), 4.0)
     sf = min(rate, fps)
-    svf = f"fps={sf:.6f},scale=-2:trunc(min(ih\\,{COARSE_H})/2)*2:flags=bilinear"
-    # Decode at the requested sample rate; dimensions are obtained from the first frame.
+    svf = rf"fps={sf:.6f},scale=-2:trunc(min(ih\,{COARSE_H})/2)*2:flags=bilinear"
+    scale_factor = min(1.0, COARSE_H / h)
+    sw = max(64, round(w * scale_factor) // 2 * 2)
+    sh = max(32, round(h * scale_factor) // 2 * 2)
     out = []
-    for idx, buf in _iter_frames(src, svf, w if False else max(64, round(w * min(1.0, COARSE_H / h)) // 2 * 2),
-                                max(32, round(h * min(1.0, COARSE_H / h)) // 2 * 2),
-                                limit=max_samples):
-        sw = max(64, round(w * min(1.0, COARSE_H / h)) // 2 * 2)
-        sh = max(32, round(h * min(1.0, COARSE_H / h)) // 2 * 2)
+    for idx, buf in _iter_frames(src, svf, sw, sh, limit=max_samples):
         gray = np.frombuffer(buf, np.uint8, count=sw * sh).reshape(sh, sw).copy()
         kp, des = _orb(gray, 700)
         out.append((idx, idx / sf, gray, kp, des))
     return out, fps, vf, w, h, sf
-
 
 def _match_desc(ld, od) -> int:
     if ld is None or od is None or len(ld) < 6 or len(od) < 6:
