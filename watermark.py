@@ -26,10 +26,12 @@ from PIL import Image, ImageOps
 N_BITS = 96
 CELL = 16
 AMP = 4.0
-VIDEO_GROUP = 4
+VIDEO_GROUP = 8
 MATCH_H = 360
 COARSE_H = 240
 VIDEO_MAX_FPS = 30.0
+TRACE_COARSE_FPS = 0.5
+TRACE_MAX_SAMPLES = 180
 
 _x, _y = np.mgrid[:CELL, :CELL].astype(np.float32)
 _CARRIER = (
@@ -617,20 +619,37 @@ def _orb(g: np.ndarray, nfeatures: int = 700):
     return orb.detectAndCompute(g, None)
 
 
-def _coarse_frames(src: Path, max_height: int, sample_fps: float = 2.0,
-                   max_samples: int = 360):
+def _visual_signature(gray: np.ndarray, width: int = 64, height: int = 36) -> np.ndarray:
+    """Compact normalized appearance fingerprint for fast temporal localization."""
+    small = cv2.resize(gray, (width, height), interpolation=cv2.INTER_AREA).astype(np.float32)
+    small = cv2.GaussianBlur(small, (3, 3), 0)
+    small = (small - float(small.mean())) / max(float(small.std()), 1.0)
+    gx = cv2.Sobel(small, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(small, cv2.CV_32F, 0, 1, ksize=3)
+    grad = cv2.magnitude(gx, gy)
+    grad = (grad - float(grad.mean())) / max(float(grad.std()), 1.0)
+    sig = np.concatenate((small.ravel(), grad.ravel())).astype(np.float32)
+    n = float(np.linalg.norm(sig))
+    return sig / max(n, 1e-6)
+
+
+def _coarse_frames(src: Path, max_height: int, sample_fps: float = TRACE_COARSE_FPS,
+                   max_samples: int = TRACE_MAX_SAMPLES):
+    """Sample the whole video at low resolution for fast temporal localization."""
     w, h, fps, vf = _probe_video(src, max_height)
-    rate = min(max(sample_fps, .5), 4.0)
+    duration = _video_duration_seconds(src)
+    rate = min(max(float(sample_fps), 0.5), 2.0)
     sf = min(rate, fps)
-    svf = rf"fps={sf:.6f},scale=-2:trunc(min(ih\,{COARSE_H})/2)*2:flags=bilinear"
+    if duration > 0:
+        max_samples = min(max(int(max_samples), 24), max(24, int(np.ceil(duration * sf)) + 2))
+    svf = f"fps={sf:.6f},scale=-2:trunc(min(ih\,{COARSE_H})/2)*2:flags=bilinear"
     scale_factor = min(1.0, COARSE_H / h)
     sw = max(64, round(w * scale_factor) // 2 * 2)
     sh = max(32, round(h * scale_factor) // 2 * 2)
     out = []
     for idx, buf in _iter_frames(src, svf, sw, sh, limit=max_samples):
         gray = np.frombuffer(buf, np.uint8, count=sw * sh).reshape(sh, sw).copy()
-        kp, des = _orb(gray, 700)
-        out.append((idx, idx / sf, gray, kp, des))
+        out.append((idx, idx / sf, gray, _visual_signature(gray), None))
     return out, fps, vf, w, h, sf
 
 def _match_desc(ld, od) -> int:
@@ -641,49 +660,83 @@ def _match_desc(ld, od) -> int:
     return len(good)
 
 
-def _coarse_candidates(leak_sample, orig_samples, n=10):
-    _, ltime, _, _, ld = leak_sample
-    scored = []
-    for oi, otime, _, _, od in orig_samples:
-        score = _match_desc(ld, od)
-        if score:
-            scored.append((score, oi, otime, ltime))
-    scored.sort(reverse=True)
-    return scored[:n]
-
-
 def _best_time_map(leak_samples, orig_samples) -> tuple[float, float, int]:
-    """Fit original_time ~= a*leak_time + b using several cheap ORB anchors."""
-    picks = np.linspace(0, len(leak_samples) - 1, min(5, len(leak_samples)), dtype=int)
+    """Estimate original_time ~= a*leak_time + b using cheap frame fingerprints."""
+    if not leak_samples or not orig_samples:
+        raise RuntimeError("Could not locate leaked video in original.")
+
+    orig_times = np.asarray([x[1] for x in orig_samples], np.float32)
+    orig_sig = np.stack([x[3] for x in orig_samples]).astype(np.float32)
+    picks = np.linspace(0, len(leak_samples) - 1, min(7, len(leak_samples)), dtype=int)
     pairs = []
     for i in picks:
-        cand = _coarse_candidates(leak_samples[int(i)], orig_samples, 8)
-        if not cand:
+        lt = float(leak_samples[int(i)][1])
+        ls = leak_samples[int(i)][3]
+        scores = orig_sig @ ls
+        k = min(6, len(scores))
+        if k <= 0:
             continue
-        # Keep several possibilities; later RANSAC-style scoring selects the consistent map.
-        pairs.extend((c[0], c[3], c[2]) for c in cand)
+        idxs = np.argpartition(scores, -k)[-k:]
+        idxs = idxs[np.argsort(scores[idxs])[::-1]]
+        for oi in idxs:
+            pairs.append((float(scores[oi]), lt, float(orig_times[oi])))
     if not pairs:
         raise RuntimeError("Could not locate leaked video in original.")
 
+    lt_arr = np.asarray([p[1] for p in pairs], np.float32)
+    ot_arr = np.asarray([p[2] for p in pairs], np.float32)
+    sc_arr = np.asarray([p[0] for p in pairs], np.float32)
     best = None
-    # Most social-media processing preserves timing, so keep slope around 1 but permit modest retiming.
-    slopes = np.linspace(.85, 1.18, 18)
-    for a in slopes:
-        for _, lt, ot in pairs:
+    for a in np.linspace(0.94, 1.06, 13):
+        for _, lt, ot in sorted(pairs, reverse=True)[:24]:
             b = ot - a * lt
-            residuals = sorted(abs((a * p[1] + b) - p[2]) for p in pairs)
-            if not residuals:
-                continue
-            inliers = sum(r <= .65 for r in residuals)
-            score = inliers * 10 - np.median(residuals)
-            candidate = (score, a, b, inliers)
-            if best is None or candidate[0] > best[0]:
+            residuals = np.abs(a * lt_arr + b - ot_arr)
+            inliers = int(np.count_nonzero(residuals <= 1.0))
+            score = float(np.sum(np.maximum(0.0, sc_arr - 0.50) *
+                                 (residuals <= 1.5)))
+            candidate = (inliers, score, float(a), float(b))
+            if best is None or candidate[:2] > best[:2]:
                 best = candidate
-    if best is None or best[3] < 2:
-        # Single-anchor fallback.
-        _, lt, ot = max(pairs, key=lambda x: x[0])
+    if best is None:
+        score0, lt, ot = max(pairs, key=lambda x: x[0])
         return 1.0, ot - lt, 1
-    return best[1], best[2], best[3]
+    return best[2], best[3], best[0]
+
+
+def _decode_exact_pair(orig_gray: np.ndarray, leak_rgb: np.ndarray, orig_frame_idx: int,
+                       key: bytes, reveal_id: str, max_height: int) -> Optional[tuple]:
+    """Decode one frame pair cheaply first, then fall back to feature registration."""
+    del max_height
+    orig_y = orig_gray.astype(np.float32)
+    leak_y = leak_rgb @ RGB2Y
+    # Common case: same geometry after a Discord re-upload. Avoid SIFT entirely.
+    if orig_y.shape == leak_y.shape:
+        scores = _score(orig_y, leak_y, key, reveal_id, int(orig_frame_idx) // VIDEO_GROUP)
+        uid, ok = decode_payload(scores)
+        if ok:
+            return int(uid), float(np.mean(np.abs(scores))), 1.0, int(orig_frame_idx), "direct"
+
+    # Small resize-only changes are also common. Directly rescale before paying for SIFT.
+    oh, ow = orig_y.shape
+    lh, lw = leak_y.shape
+    if lh >= 32 and lw >= 32 and abs((ow / max(oh, 1)) - (lw / max(lh, 1))) < 0.025:
+        resized = cv2.resize(leak_y, (ow, oh), interpolation=cv2.INTER_CUBIC)
+        scores = _score(orig_y, resized, key, reveal_id, int(orig_frame_idx) // VIDEO_GROUP)
+        uid, ok = decode_payload(scores)
+        if ok:
+            return int(uid), float(np.mean(np.abs(scores))), 0.95, int(orig_frame_idx), "resize-direct"
+
+    # Hard case: crop/rotation/unknown scale. Run the existing robust registration only now.
+    orig_rgb = cv2.cvtColor(orig_gray.astype(np.uint8), cv2.COLOR_GRAY2RGB)
+    regs = _registration_candidates(orig_rgb, leak_rgb)
+    for H, reg, method in regs[:4]:
+        uid, metric, _ = _decode_registered(
+            orig_y, leak_y, key, reveal_id,
+            int(orig_frame_idx) // VIDEO_GROUP, _geometry_variants(H)
+        )
+        if uid is not None:
+            return int(uid), float(metric), float(reg), int(orig_frame_idx), method
+    return None
 
 
 def _exact_video_frame(orig: Path, leak_rgb: np.ndarray, approx_frame: int,
@@ -918,42 +971,73 @@ def extract_video(orig: Path, leak: Path, key: bytes, reveal_id: str, *,
                   cell: int = CELL, max_height: int = 1080, start_frame: int = 0,
                   group: int = VIDEO_GROUP) -> dict:
     del cell, group
-    if start_frame:
-        sampled = _read_frame_near_index(leak, max_height, int(start_frame))
-        if sampled is not None:
-            leak_frame, _, _, _ = sampled
-            hit = _exact_video_frame(orig, cv2.cvtColor(leak_frame, cv2.COLOR_GRAY2RGB),
-                                     int(start_frame), key, reveal_id, max_height, max_radius_seconds=1.5)
+
+    # Explicit original-frame hint. Decode the leaked frame near its equivalent
+    # timestamp and test a tiny time neighborhood rather than scanning the timeline.
+    if int(start_frame) > 0:
+        _, _, ofps, _ = _probe_video(orig, max_height)
+        source_t = max(0.0, int(start_frame) / max(ofps, 1e-6))
+        for dt in (0.0, -0.20, 0.20, -0.40, 0.40):
+            leak_hit = _read_frame_at_time(leak, max_height, max(0.0, source_t + dt))
+            if leak_hit is None:
+                continue
+            leak_frame, _, _, _ = leak_hit
+            orig_hit = _read_frame_at_time(orig, max_height, source_t + dt)
+            if orig_hit is None:
+                continue
+            orig_frame, exact_fps, _, _ = orig_hit
+            hit = _decode_exact_pair(
+                orig_frame, cv2.cvtColor(leak_frame, cv2.COLOR_GRAY2RGB),
+                int(round((source_t + dt) * exact_fps)), key, reveal_id, max_height
+            )
             if hit is not None:
                 uid, metric, reg, frame_idx, method = hit
                 return {"valid": True, "user_id": int(uid), "start_frame": int(frame_idx),
-                        "frames_used": 1, "anchors": 1, "watermark_metric": round(float(metric), 4),
-                        "registration": method}
+                        "frames_used": 1, "anchors": 1,
+                        "watermark_metric": round(float(metric), 4),
+                        "registration_score": round(float(reg), 3), "registration": method}
 
+    # Fast path for an ordinary re-upload with unchanged timing/geometry.
     fast_hit = _fast_direct_video_extract(orig, leak, key, reveal_id, max_height)
     if fast_hit is not None:
         return fast_hit
 
-    leak_samples, leak_fps, _, _, _, _ = _coarse_frames(leak, max_height, sample_fps=2.0, max_samples=80)
-    orig_samples, orig_fps, _, _, _, _ = _coarse_frames(orig, max_height, sample_fps=2.0, max_samples=360)
+    # Localize a trimmed/retimed excerpt using a few ultra-cheap signatures over the
+    # entire supported duration, then decode only the short-listed original frames.
+    leak_samples, leak_fps, _, _, _, _ = _coarse_frames(
+        leak, max_height, sample_fps=TRACE_COARSE_FPS, max_samples=TRACE_MAX_SAMPLES
+    )
+    orig_samples, orig_fps, _, _, _, _ = _coarse_frames(
+        orig, max_height, sample_fps=TRACE_COARSE_FPS, max_samples=TRACE_MAX_SAMPLES
+    )
     if not leak_samples or not orig_samples:
         raise RuntimeError("Could not sample video frames.")
 
     a, b, anchors = _best_time_map(leak_samples, orig_samples)
-    picks = np.linspace(0, len(leak_samples) - 1, min(6, len(leak_samples)), dtype=int)
+    picks = np.linspace(0, len(leak_samples) - 1, min(5, len(leak_samples)), dtype=int)
     hits = []
     for p in picks:
         ls = leak_samples[int(p)]
-        predicted_time = a * ls[1] + b
-        approx = max(0, int(round(predicted_time * orig_fps)))
-        # Reconstruct RGB only for SIFT registration; grayscale content is sufficient for ORB,
-        # but the leak's actual geometry must be preserved.
-        # The coarse frame is grayscale; convert to RGB for the registration stage.
-        leak_rgb = cv2.cvtColor(ls[2], cv2.COLOR_GRAY2RGB)
-        hit = _exact_video_frame(orig, leak_rgb, approx, key, reveal_id, max_height, max_radius_seconds=.9)
-        if hit is not None:
-            uid, metric, reg, frame_idx, method = hit
-            hits.append((uid, metric, reg, frame_idx, method))
+        predicted_time = max(0.0, a * ls[1] + b)
+        # Signature matching is approximate. Test five nearby timestamps and stop at
+        # the first CRC-verified watermark. This avoids the old full local frame scan.
+        for dt in (0.0, -0.25, 0.25, -0.50, 0.50):
+            t_orig = max(0.0, predicted_time + dt)
+            t_leak = max(0.0, float(ls[1]))
+            orig_hit = _read_frame_at_time(orig, max_height, t_orig)
+            leak_hit = _read_frame_at_time(leak, max_height, t_leak)
+            if orig_hit is None or leak_hit is None:
+                continue
+            orig_frame, exact_fps, _, _ = orig_hit
+            leak_frame, _, _, _ = leak_hit
+            idx = int(round(t_orig * exact_fps))
+            hit = _decode_exact_pair(
+                orig_frame, cv2.cvtColor(leak_frame, cv2.COLOR_GRAY2RGB), idx,
+                key, reveal_id, max_height
+            )
+            if hit is not None:
+                hits.append(hit)
+                break
 
     if not hits:
         raise RuntimeError("No valid watermark found in the leaked video.")
@@ -963,11 +1047,12 @@ def extract_video(orig: Path, leak: Path, key: bytes, reveal_id: str, *,
         counts[int(uid)] = counts.get(int(uid), 0) + 1
     uid = max(counts, key=counts.get)
     same = [h for h in hits if int(h[0]) == int(uid)]
-    return {"valid": True, "user_id": int(uid), "start_frame": int(same[0][3]),
+    if len(hits) >= 3 and len(same) < 2:
+        raise RuntimeError("Watermark evidence was inconsistent across the video.")
+    return {"valid": True, "user_id": uid, "start_frame": int(same[0][3]),
             "frames_used": len(same), "anchors": int(anchors),
             "watermark_metric": round(float(np.mean([x[1] for x in same])), 4),
             "registration": same[0][4]}
-
 
 def extract(orig: Path, leak: Path, kind: str, key: bytes, reveal_id: str, *,
             image_cell: int = CELL, video_cell: int = CELL, max_height: int = 1080,
