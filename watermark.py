@@ -432,28 +432,50 @@ def _video_duration_seconds(src: Path) -> float:
     return float(m.group(1)) * 3600.0 + float(m.group(2)) * 60.0 + float(m.group(3))
 
 
-def _adaptive_video_height(source_height: int, duration: float, requested_max: int) -> int:
-    """Preserve source resolution up to the configured delivery ceiling.
+def _adaptive_video_height(source_width: int, source_height: int, duration: float, requested_max: int,
+                           target_bytes: Optional[int], audio_bps: int, fps: float) -> int:
+    """Choose the highest useful resolution that the attachment budget can sustain.
 
-    We no longer reduce resolution merely because a clip is long: external streaming
-    delivery is not constrained by Discord's attachment-size limit, and the old duration
-    caps were a direct source of visibly soft/blurry long videos.
+    Discord attachment delivery is size-limited. Keeping 1080p on a long clip while
+    starving it of bitrate is what creates the visibly soft result we want to avoid.
+    Estimate the available video bitrate and choose the highest resolution whose
+    pixels/sec can be encoded at a sane H.264 rate.
     """
-    del duration
     ceiling = min(int(source_height), int(requested_max))
-    return max(144, ceiling)
+    source_width = max(2, int(source_width))
+    if ceiling <= 360 or not target_bytes or duration <= 0:
+        return max(144, ceiling)
+
+    # Leave headroom for MP4/container overhead while preserving as much of the
+    # attachment allowance as possible for video detail.
+    usable_bits = max(1, int(target_bytes * 8 * 0.965) - int(audio_bps * duration))
+    available_bps = usable_bits / max(duration, 1.0)
+    test_fps = max(24.0, min(float(fps), 30.0))
+
+    # Rough H.264 quality floor in bits/pixel/frame. High profile + B-frames is
+    # substantially more efficient than the old constrained-baseline/no-B-frame path.
+    min_bpp = 0.062
+    for candidate in (1080, 900, 720, 648, 576, 540, 480, 360):
+        if candidate > ceiling:
+            continue
+        candidate_width = max(2, round(source_width * candidate / max(source_height, 1)))
+        required = candidate_width * candidate * test_fps * min_bpp
+        if available_bps >= required:
+            return max(144, int(candidate))
+    return min(360, ceiling)
 
 
 def embed_video(src: Path, dst: Path, user_id: int, key: bytes, reveal_id: str, *,
-                amp: float = AMP, cell: int = CELL, crf: int = 19, preset: str = "veryfast",
-                max_seconds: int = 300, max_height: int = 720, group: int = VIDEO_GROUP,
+                amp: float = AMP, cell: int = CELL, crf: int = 18, preset: str = "faster",
+                max_seconds: int = 300, max_height: int = 1080, group: int = VIDEO_GROUP,
                 target_bytes: Optional[int] = None, audio_kbps: int = 96) -> None:
-    """Embed a watermark while producing a mobile-safe, streamable MP4 with a bounded size.
+    """Embed a watermark into a Discord/mobile-friendly MP4 without throwing away detail.
 
-    The output deliberately favors decoder compatibility: AVC/H.264 Baseline, yuv420p,
-    no B-frames, one reference frame, frequent keyframes, AAC audio and +faststart.
-    A constrained CRF/maxrate encode keeps short clips high quality while preventing
-    long clips from becoming huge Discord attachments.
+    Native Discord delivery is intentionally used by the bot. This encoder therefore
+    prioritizes H.264 High profile efficiency, yuv420p compatibility, B-frames/reference
+    frames for quality-per-bit, short-ish keyframe intervals, AAC audio and +faststart.
+    When an attachment-size budget is supplied, the video bitrate is calculated from that
+    exact budget instead of relying on a low-quality CRF/maxrate compromise.
     """
     del cell
     ff = get_ffmpeg()
@@ -467,32 +489,35 @@ def embed_video(src: Path, dst: Path, user_id: int, key: bytes, reveal_id: str, 
         target = max(2 * 1048576, target)
 
     bits = encode_payload(user_id)
-    src_probe = _probe_video(src, max_height)
-    _, source_h, fps, _ = src_probe
-    delivery_height = _adaptive_video_height(source_h, duration, max_height)
-    _, h, fps, vf = _probe_video(src, delivery_height)
-    # _probe_video returns the normalized dimensions for the requested height.
-    w, h, fps, vf = _probe_video(src, delivery_height)
-    gop = max(30, min(60, int(round(fps * 2.0))))
+    source_w, source_h, source_fps, _ = _probe_video(src, max_height)
     audio_bps = max(64000, min(128000, int(audio_kbps) * 1000))
+    delivery_height = _adaptive_video_height(
+        source_w, source_h, duration, max_height, target, audio_bps, source_fps
+    )
+    w, h, fps, vf = _probe_video(src, delivery_height)
+    fps = min(float(fps), 30.0)
+    gop = max(48, min(72, int(round(fps * 2.0))))
     dst.parent.mkdir(parents=True, exist_ok=True)
 
-    # CRF drives quality. When an attachment-size target is required (local/fallback
-    # delivery), maxrate is derived from that target. For external streaming, allow a
-    # substantially larger bitrate so the personalized video does not look soft.
+    # For native Discord attachments, derive an average video bitrate from the actual
+    # upload budget. This is the key quality fix: the old CRF+VBV setup often encoded
+    # long clips far below what the 20 MiB budget could actually sustain.
     if target:
-        usable_bits = max(1, int(target * 8 * 0.91) - int(audio_bps * duration))
-        maxrate = int(max(700_000, min(6_000_000, usable_bits / max(duration, 1.0))))
+        usable_bits = max(1, int(target * 8 * 0.965) - int(audio_bps * duration))
+        avg_video_bps = max(350_000, int(usable_bits / max(duration, 1.0)))
+        maxrate = int(avg_video_bps * 1.12)
+        bufsize = max(2_000_000, int(avg_video_bps * 2.4))
     else:
         if h >= 900:
-            maxrate = 10_000_000
+            avg_video_bps = 9_000_000
         elif h >= 700:
-            maxrate = 7_000_000
+            avg_video_bps = 6_500_000
         else:
-            maxrate = 4_500_000
-    bufsize = max(1_400_000, maxrate * 2)
+            avg_video_bps = 4_000_000
+        maxrate = int(avg_video_bps * 1.20)
+        bufsize = max(2_000_000, int(avg_video_bps * 2.4))
 
-    def encode_once(out_path: Path, pass_crf: int, pass_height: int, pass_maxrate: int) -> int:
+    def encode_once(out_path: Path, pass_crf: int, pass_height: int, pass_rate: int) -> int:
         pw, ph, pfps, pvf = _probe_video(src, pass_height)
         err = tempfile.TemporaryFile()
         enc = subprocess.Popen(
@@ -503,16 +528,17 @@ def embed_video(src: Path, dst: Path, user_id: int, key: bytes, reveal_id: str, 
                 "-i", str(src),
                 "-map", "0:v:0", "-map", "1:a:0?",
                 "-c:v", "libx264", "-preset", preset,
-                "-crf", str(pass_crf), "-maxrate", str(pass_maxrate),
-                "-bufsize", str(max(pass_maxrate * 2, 1_400_000)),
-                "-profile:v", "main", "-level", "4.0",
-                "-pix_fmt", "yuv420p", "-bf", "0", "-refs", "1",
-                "-g", str(gop), "-keyint_min", str(max(30, gop // 2)), "-sc_threshold", "40",
+                "-b:v", str(pass_rate), "-maxrate", str(max(pass_rate + 1, int(pass_rate * 1.12))),
+                "-bufsize", str(max(int(pass_rate * 2.4), 2_000_000)),
+                "-profile:v", "high", "-level", "4.1",
+                "-pix_fmt", "yuv420p", "-bf", "2", "-refs", "3",
+                "-g", str(gop), "-keyint_min", str(max(24, gop // 2)), "-sc_threshold", "40",
+                "-x264-params", "aq-mode=2:aq-strength=1.0:rc-lookahead=30:deblock=0,0",
                 "-tag:v", "avc1",
                 "-c:a", "aac", "-b:a", str(audio_bps), "-ar", "48000", "-ac", "2",
                 "-map_metadata", "-1", "-map_chapters", "-1", "-sn", "-dn",
                 "-avoid_negative_ts", "make_zero", "-movflags", "+faststart",
-                "-t", str(duration), "-shortest", str(out_path),
+                "-t", str(duration), str(out_path),
             ],
             stdin=subprocess.PIPE, stderr=err, bufsize=1024 * 1024,
         )
@@ -554,19 +580,19 @@ def embed_video(src: Path, dst: Path, user_id: int, key: bytes, reveal_id: str, 
             raise RuntimeError("FFmpeg encode failed" + (f": {error_text}" if error_text else "."))
         return frames
 
-    # Usually one pass. If the content defeats the first CRF/maxrate combination,
-    # tighten it once or twice rather than shipping an attachment that takes forever.
-    attempts = [(int(crf), delivery_height, maxrate)]
-    if target:
-        attempts.append((min(26, int(crf) + 2), delivery_height, max(550_000, int(maxrate * 0.85))))
-        if delivery_height > 480:
-            attempts.append((min(25, int(crf) + 1), max(360, delivery_height - 144), max(500_000, int(maxrate * 0.82))))
-
     last_size = 0
-    for attempt_no, (attempt_crf, attempt_height, attempt_rate) in enumerate(attempts, 1):
+    # First pass: spend essentially the whole native Discord upload budget.
+    attempts = [(1, delivery_height, avg_video_bps)]
+    # A small fallback handles hard-to-compress footage or mux overhead overshoot.
+    if target:
+        attempts.append((2, delivery_height, max(350_000, int(avg_video_bps * 0.92))))
+        if delivery_height > 480:
+            attempts.append((3, max(480, delivery_height - 72), max(350_000, int(avg_video_bps * 0.95))))
+
+    for attempt_no, attempt_height, attempt_rate in attempts:
         tmp_out = dst.with_name(f"{dst.stem}.encode{attempt_no}.tmp{dst.suffix}")
         try:
-            encode_once(tmp_out, attempt_crf, attempt_height, attempt_rate)
+            encode_once(tmp_out, int(crf), attempt_height, attempt_rate)
             last_size = tmp_out.stat().st_size
             if not target or last_size <= target:
                 tmp_out.replace(dst)
