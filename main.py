@@ -37,11 +37,11 @@ MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "2"))
 PENDING_UPLOAD_TIMEOUT = int(os.getenv("PENDING_UPLOAD_TIMEOUT", "300"))
 MAX_VIDEO_SECONDS = int(os.getenv("MAX_VIDEO_SECONDS", "300"))
 MAX_VIDEO_HEIGHT = int(os.getenv("MAX_VIDEO_HEIGHT", "720"))
-VIDEO_CRF = int(os.getenv("VIDEO_CRF", "19"))
+VIDEO_CRF = int(os.getenv("VIDEO_CRF", "18"))
 VIDEO_PRESET = os.getenv("VIDEO_PRESET", "veryfast")
 VIDEO_AUDIO_KBPS = int(os.getenv("VIDEO_AUDIO_KBPS", "96"))
 VIDEO_TARGET_MAX_MB = float(os.getenv("VIDEO_TARGET_MAX_MB", "18.0"))
-VIDEO_CACHE_VERSION = os.getenv("VIDEO_CACHE_VERSION", "v4")
+VIDEO_CACHE_VERSION = os.getenv("VIDEO_CACHE_VERSION", "v5")
 DELETE_UPLOAD_MESSAGE = os.getenv("DELETE_UPLOAD_MESSAGE", "true").lower() == "true"
 IMAGE_AMP = float(os.getenv("WM_IMAGE_AMP", "3.0"))
 IMAGE_CELL = int(os.getenv("WM_IMAGE_CELL", "4"))
@@ -193,6 +193,10 @@ def _media_url(reveal_id: str, user_id: int, variant: str = "preview") -> Option
     if not PUBLIC_URL:
         return None
     token = media_token(reveal_id, user_id)
+    if variant == "video":
+        # Use a real .mp4 suffix so Discord's link-preview system recognizes the
+        # URL as a video and can fetch/cache the media on its own CDN.
+        return f"{PUBLIC_URL}/media/video/{reveal_id}/{int(user_id)}/{token}/personalized.mp4?v={VIDEO_CACHE_VERSION}"
     return f"{PUBLIC_URL}/media/{reveal_id}/{int(user_id)}/{token}?v={variant}"
 
 
@@ -207,8 +211,13 @@ async def build_personalized_reveal(user_id: int, *, video_target_bytes: Optiona
     cache_dir.mkdir(parents=True, exist_ok=True)
     suffix = ".mp4" if kind == "video" else (source.suffix.lower() if source.suffix.lower() in IMAGE_EXTS else ".png")
     if kind == "video":
-        target_mb = int(round((video_target_bytes or (VIDEO_TARGET_MAX_MB * 1048576)) / 1048576))
-        output = cache_dir / f"user_{user_id}_{VIDEO_CACHE_VERSION}_{target_mb}mb.mp4"
+        if video_target_bytes is None:
+            # External streaming is not constrained by Discord's attachment limit, so
+            # keep a dedicated high-quality stream variant.
+            output = cache_dir / f"user_{user_id}_{VIDEO_CACHE_VERSION}_stream.mp4"
+        else:
+            target_mb = int(round(video_target_bytes / 1048576))
+            output = cache_dir / f"user_{user_id}_{VIDEO_CACHE_VERSION}_{target_mb}mb.mp4"
     else:
         output = cache_dir / f"user_{user_id}{suffix}"
     preview = cache_dir / f"user_{user_id}_mobile.jpg" if kind == "image" else None
@@ -264,7 +273,7 @@ async def health_handler(_: web.Request) -> web.Response:
     })
 
 
-async def media_handler(request: web.Request) -> web.StreamResponse:
+async def _secure_media_path(request: web.Request) -> tuple[dict, int]:
     reveal_id = request.match_info["reveal_id"]
     raw_user_id = request.match_info["user_id"]
     token = request.match_info["token"]
@@ -281,31 +290,66 @@ async def media_handler(request: web.Request) -> web.StreamResponse:
         raise web.HTTPNotFound()
 
     reveal = find_reveal(reveal_id)
-    if not reveal or reveal["kind"] != "image":
+    if not reveal:
+        raise web.HTTPNotFound()
+    return reveal, user_id
+
+
+async def media_handler(request: web.Request) -> web.StreamResponse:
+    reveal, user_id = await _secure_media_path(request)
+    if reveal["kind"] != "image":
         raise web.HTTPNotFound()
 
     source_suffix = Path(reveal["path"]).suffix.lower()
     if source_suffix not in IMAGE_EXTS:
         source_suffix = ".png"
-
-    original = CACHE_DIR / reveal_id / f"user_{user_id}{source_suffix}"
-    preview = CACHE_DIR / reveal_id / f"user_{user_id}_mobile.jpg"
+    cache_dir = CACHE_DIR / reveal["reveal_id"]
+    original = cache_dir / f"user_{user_id}{source_suffix}"
+    preview = cache_dir / f"user_{user_id}_mobile.jpg"
     variant = request.query.get("v", "preview").lower()
     if variant not in {"preview", "original"}:
         raise web.HTTPNotFound()
-
     path = preview if variant == "preview" else original
     if not path.exists() or path.stat().st_size <= 0:
         raise web.HTTPNotFound()
 
-    content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    response = web.FileResponse(path, headers={
+    content_type = "image/jpeg" if path == preview else (mimetypes.guess_type(path.name)[0] or "application/octet-stream")
+    return web.FileResponse(path, headers={
         "Content-Type": content_type,
         "Content-Disposition": f'inline; filename="{path.name}"',
         "Cache-Control": "public, max-age=31536000, immutable",
         "X-Content-Type-Options": "nosniff",
     })
-    return response
+
+
+async def video_media_handler(request: web.Request) -> web.StreamResponse:
+    reveal, user_id = await _secure_media_path(request)
+    if reveal["kind"] != "video":
+        raise web.HTTPNotFound()
+
+    # Prefer the dedicated streaming-quality file. Fall back to an existing attachment
+    # variant so an already-generated reveal remains playable after a deployment.
+    cache_dir = CACHE_DIR / reveal["reveal_id"]
+    preferred = cache_dir / f"user_{user_id}_{VIDEO_CACHE_VERSION}_stream.mp4"
+    candidates = [preferred] if preferred.exists() else sorted(
+        cache_dir.glob(f"user_{user_id}_*.mp4"),
+        key=lambda p: p.stat().st_mtime if p.exists() else 0,
+        reverse=True,
+    )
+    path = next((p for p in candidates if p.exists() and p.stat().st_size > 0), None)
+    if path is None:
+        raise web.HTTPNotFound()
+
+    # aiohttp FileResponse honors HTTP Range requests, which lets Discord/mobile start
+    # playback without downloading the entire video first. Keep the file inline and cacheable.
+    return web.FileResponse(path, headers={
+        "Content-Type": "video/mp4",
+        "Content-Disposition": 'inline; filename="personalized-reveal.mp4"',
+        "Cache-Control": "public, max-age=31536000, immutable",
+        "Accept-Ranges": "bytes",
+        "X-Content-Type-Options": "nosniff",
+        "X-Accel-Buffering": "no",
+    })
 
 
 async def start_http_server() -> web.AppRunner:
@@ -313,6 +357,7 @@ async def start_http_server() -> web.AppRunner:
     app.router.add_get("/", health_handler)
     app.router.add_get("/health", health_handler)
     app.router.add_get("/media/{reveal_id}/{user_id}/{token}", media_handler)
+    app.router.add_get("/media/video/{reveal_id}/{user_id}/{token}/personalized.mp4", video_media_handler)
 
     runner = web.AppRunner(app, access_log=log)
     await runner.setup()
@@ -453,9 +498,14 @@ async def view_reveal(interaction: discord.Interaction):
         upload_limit = interaction_limit or guild_limit
         video_target_bytes = None
         if CURRENT_REVEAL["kind"] == "video":
-            configured_target = int(VIDEO_TARGET_MAX_MB * 1048576)
-            safe_limit = int(upload_limit * 0.90) if upload_limit else configured_target
-            video_target_bytes = max(2 * 1048576, min(configured_target, safe_limit))
+            if PUBLIC_URL:
+                # External delivery bypasses Discord's attachment limit and prevents the
+                # client from waiting for the full attachment before it can play.
+                video_target_bytes = None
+            else:
+                configured_target = int(VIDEO_TARGET_MAX_MB * 1048576)
+                safe_limit = int(upload_limit * 0.90) if upload_limit else configured_target
+                video_target_bytes = max(2 * 1048576, min(configured_target, safe_limit))
         personalized, preview = await build_personalized_reveal(
             member.id, video_target_bytes=video_target_bytes
         )
@@ -469,20 +519,31 @@ async def view_reveal(interaction: discord.Interaction):
             embed = discord.Embed()
             embed.set_image(url=preview_url)
             await interaction.followup.send(embed=embed, ephemeral=True)
-        else:
-            # Videos are sent as a normal MP4 attachment so Discord's native mobile
-            # player handles playback. The personalized video is encoded as H.264/AAC
-            # with fast-start metadata and a lower CRF for cleaner playback.
-            if upload_limit and size_bytes > upload_limit:
+        elif CURRENT_REVEAL["kind"] == "video":
+            # Discord bots cannot directly create a playable video field inside a rich
+            # embed. A direct HTTPS MP4 URL lets Discord's own link-preview system fetch
+            # and cache the video, then stream it through Discord's media infrastructure.
+            video_url = _media_url(reveal_id, member.id, "video")
+            if video_url:
                 await interaction.followup.send(
-                    f"❌ The personalized file is too large for this server's upload limit "
-                    f"({size_bytes / 1048576:.1f} MB vs {upload_limit / 1048576:.1f} MB).",
+                    f"{video_url}",
                     ephemeral=True,
+                    suppress_embeds=False,
                 )
-                return
-            await interaction.followup.send(
-                "Here is your personalized reveal. It is uniquely marked to you — please don't share it.",
-                file=discord.File(str(personalized), filename="personalized-reveal.mp4"), ephemeral=True)
+            else:
+                # Local/non-Render fallback: use Discord's native attachment player.
+                if upload_limit and size_bytes > upload_limit:
+                    await interaction.followup.send(
+                        f"❌ The personalized file is too large for this server's upload limit "
+                        f"({size_bytes / 1048576:.1f} MB vs {upload_limit / 1048576:.1f} MB).",
+                        ephemeral=True,
+                    )
+                    return
+                await interaction.followup.send(
+                    "Here is your personalized reveal. It is uniquely marked to you — please don't share it.",
+                    file=discord.File(str(personalized), filename="personalized-reveal.mp4"), ephemeral=True)
+        else:
+            await interaction.followup.send("❌ I couldn't prepare the reveal media.", ephemeral=True)
 
         ledger_append(reveal_id, member.id)
         log.info("Served reveal_id=%s to user_id=%s size=%d", reveal_id, member.id, size_bytes)
