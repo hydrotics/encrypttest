@@ -37,8 +37,8 @@ MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "2"))
 PENDING_UPLOAD_TIMEOUT = int(os.getenv("PENDING_UPLOAD_TIMEOUT", "300"))
 MAX_VIDEO_SECONDS = int(os.getenv("MAX_VIDEO_SECONDS", "300"))
 MAX_VIDEO_HEIGHT = int(os.getenv("MAX_VIDEO_HEIGHT", "1080"))
-VIDEO_CRF = int(os.getenv("VIDEO_CRF", "23"))
-VIDEO_PRESET = os.getenv("VIDEO_PRESET", "veryfast")
+VIDEO_CRF = int(os.getenv("VIDEO_CRF", "20"))
+VIDEO_PRESET = os.getenv("VIDEO_PRESET", "medium")
 DELETE_UPLOAD_MESSAGE = os.getenv("DELETE_UPLOAD_MESSAGE", "true").lower() == "true"
 IMAGE_AMP = float(os.getenv("WM_IMAGE_AMP", "3.0"))
 IMAGE_CELL = int(os.getenv("WM_IMAGE_CELL", "4"))
@@ -53,7 +53,7 @@ HTTP_PORT = int(os.getenv("PORT", "10000"))
 PUBLIC_URL = (os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
 
 # The Discord client benefits from a smaller, baseline JPEG for the mobile preview.
-# The original personalized image is still kept and exposed as the full-resolution link.
+# The original personalized image remains on disk for the bot's internal reveal/trace workflow.
 IMAGE_PREVIEW_MAX_DIM = int(os.getenv("IMAGE_PREVIEW_MAX_DIM", "2048"))
 IMAGE_PREVIEW_QUALITY = int(os.getenv("IMAGE_PREVIEW_QUALITY", "88"))
 
@@ -426,26 +426,17 @@ async def view_reveal(interaction: discord.Interaction):
         size_bytes = personalized.stat().st_size
         reveal_id = CURRENT_REVEAL["reveal_id"]
 
-        # Images are served through our Render HTTPS endpoint inside a Discord embed.
-        # This avoids forcing Discord mobile to upload/download the large source file
-        # as an attachment before it can display it.
+        # Images use a single Discord embed backed by the fast mobile preview.
+        # There is intentionally no separate full-resolution link.
         preview_url = _media_url(reveal_id, member.id, "preview")
-        original_url = _media_url(reveal_id, member.id, "original")
-        if preview is not None and preview_url and original_url:
-            embed = discord.Embed(
-                title="Your personalized reveal",
-                description="The preview is optimized for fast mobile loading. The full-resolution image is linked below.",
-            )
+        if preview is not None and preview_url:
+            embed = discord.Embed()
             embed.set_image(url=preview_url)
-            await interaction.followup.send(
-                content=(
-                    "Here is your personalized reveal. It is uniquely marked to you — please don't share it.\n"
-                    f"[Open full-resolution image]({original_url})"
-                ),
-                embed=embed,
-                ephemeral=True,
-            )
+            await interaction.followup.send(embed=embed, ephemeral=True)
         else:
+            # Videos are sent as a normal MP4 attachment so Discord's native mobile
+            # player handles playback. The personalized video is encoded as H.264/AAC
+            # with fast-start metadata and a lower CRF for cleaner playback.
             if guild_limit and size_bytes > guild_limit:
                 await interaction.followup.send(
                     f"❌ The personalized file is too large for this server's upload limit "
