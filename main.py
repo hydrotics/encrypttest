@@ -36,12 +36,12 @@ BOOSTER_ROLE_ID = int(os.getenv("BOOSTER_ROLE_ID", "0") or 0)
 MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "2"))
 PENDING_UPLOAD_TIMEOUT = int(os.getenv("PENDING_UPLOAD_TIMEOUT", "300"))
 MAX_VIDEO_SECONDS = int(os.getenv("MAX_VIDEO_SECONDS", "300"))
-MAX_VIDEO_HEIGHT = int(os.getenv("MAX_VIDEO_HEIGHT", "720"))
+MAX_VIDEO_HEIGHT = int(os.getenv("MAX_VIDEO_HEIGHT", "1080"))
 VIDEO_CRF = int(os.getenv("VIDEO_CRF", "18"))
-VIDEO_PRESET = os.getenv("VIDEO_PRESET", "veryfast")
+VIDEO_PRESET = os.getenv("VIDEO_PRESET", "faster")
 VIDEO_AUDIO_KBPS = int(os.getenv("VIDEO_AUDIO_KBPS", "96"))
-VIDEO_TARGET_MAX_MB = float(os.getenv("VIDEO_TARGET_MAX_MB", "18.0"))
-VIDEO_CACHE_VERSION = os.getenv("VIDEO_CACHE_VERSION", "v5")
+VIDEO_TARGET_MAX_MB = float(os.getenv("VIDEO_TARGET_MAX_MB", "19.5"))
+VIDEO_CACHE_VERSION = os.getenv("VIDEO_CACHE_VERSION", "v6")
 DELETE_UPLOAD_MESSAGE = os.getenv("DELETE_UPLOAD_MESSAGE", "true").lower() == "true"
 IMAGE_AMP = float(os.getenv("WM_IMAGE_AMP", "3.0"))
 IMAGE_CELL = int(os.getenv("WM_IMAGE_CELL", "4"))
@@ -498,50 +498,43 @@ async def view_reveal(interaction: discord.Interaction):
         upload_limit = interaction_limit or guild_limit
         video_target_bytes = None
         if CURRENT_REVEAL["kind"] == "video":
-            if PUBLIC_URL:
-                # External delivery bypasses Discord's attachment limit and prevents the
-                # client from waiting for the full attachment before it can play.
-                video_target_bytes = None
+            # Videos must be native Discord attachments so they play in Discord's
+            # built-in player with no visible URL. Keep a small safety margin under
+            # the actual guild upload limit.
+            configured_target = int(VIDEO_TARGET_MAX_MB * 1048576)
+            if upload_limit:
+                safety_margin = min(512 * 1024, max(128 * 1024, int(upload_limit * 0.025)))
+                safe_limit = max(4 * 1048576, int(upload_limit) - safety_margin)
+                video_target_bytes = min(configured_target, safe_limit)
             else:
-                configured_target = int(VIDEO_TARGET_MAX_MB * 1048576)
-                safe_limit = int(upload_limit * 0.90) if upload_limit else configured_target
-                video_target_bytes = max(2 * 1048576, min(configured_target, safe_limit))
+                video_target_bytes = configured_target
         personalized, preview = await build_personalized_reveal(
             member.id, video_target_bytes=video_target_bytes
         )
         size_bytes = personalized.stat().st_size
         reveal_id = CURRENT_REVEAL["reveal_id"]
 
-        # Images use a single Discord embed backed by the fast mobile preview.
-        # There is intentionally no separate full-resolution link.
+        # Images remain an embed. Videos are deliberately sent as native Discord
+        # attachments: Discord's API does not let bots create a rich-embed video player
+        # for arbitrary self-hosted MP4 files, while native MP4 attachments get Discord's
+        # own mobile video player without exposing a URL in chat.
         preview_url = _media_url(reveal_id, member.id, "preview")
         if preview is not None and preview_url:
             embed = discord.Embed()
             embed.set_image(url=preview_url)
             await interaction.followup.send(embed=embed, ephemeral=True)
         elif CURRENT_REVEAL["kind"] == "video":
-            # Discord bots cannot directly create a playable video field inside a rich
-            # embed. A direct HTTPS MP4 URL lets Discord's own link-preview system fetch
-            # and cache the video, then stream it through Discord's media infrastructure.
-            video_url = _media_url(reveal_id, member.id, "video")
-            if video_url:
+            if upload_limit and size_bytes > upload_limit:
                 await interaction.followup.send(
-                    f"{video_url}",
+                    f"❌ The personalized video is too large for this server's upload limit "
+                    f"({size_bytes / 1048576:.1f} MB vs {upload_limit / 1048576:.1f} MB).",
                     ephemeral=True,
-                    suppress_embeds=False,
                 )
-            else:
-                # Local/non-Render fallback: use Discord's native attachment player.
-                if upload_limit and size_bytes > upload_limit:
-                    await interaction.followup.send(
-                        f"❌ The personalized file is too large for this server's upload limit "
-                        f"({size_bytes / 1048576:.1f} MB vs {upload_limit / 1048576:.1f} MB).",
-                        ephemeral=True,
-                    )
-                    return
-                await interaction.followup.send(
-                    "Here is your personalized reveal. It is uniquely marked to you — please don't share it.",
-                    file=discord.File(str(personalized), filename="personalized-reveal.mp4"), ephemeral=True)
+                return
+            await interaction.followup.send(
+                file=discord.File(str(personalized), filename="personalized-reveal.mp4"),
+                ephemeral=True,
+            )
         else:
             await interaction.followup.send("❌ I couldn't prepare the reveal media.", ephemeral=True)
 
