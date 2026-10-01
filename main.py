@@ -7,6 +7,7 @@ import re
 import secrets
 import shutil
 import socket
+import threading
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -21,6 +22,7 @@ from dotenv import load_dotenv
 from PIL import Image
 
 import watermark as wm
+from health_server import start_health_server
 
 load_dotenv()
 
@@ -484,10 +486,16 @@ async def send_personalized_reveal(interaction: discord.Interaction) -> None:
     )
 
     try:
-        await interaction.edit_original_response(
-            content=content,
-            attachments=[discord.File(path, filename=filename, spoiler=False)],
-        )
+        # Send the attachment as its own ephemeral follow-up. Discord's mobile
+        # clients can fail to initialize inline video playback when a file is
+        # added by editing the deferred interaction response.
+        with discord.File(path, filename=filename, spoiler=False) as reveal_file:
+            await interaction.followup.send(
+                content=content,
+                file=reveal_file,
+                ephemeral=True,
+                wait=True,
+            )
     except Exception:
         log.exception(
             "Failed to deliver reveal attachment reveal=%s user=%s",
@@ -501,6 +509,14 @@ async def send_personalized_reveal(interaction: discord.Interaction) -> None:
         except discord.HTTPException:
             log.exception("Could not update failed reveal response for user=%s", interaction.user.id)
         return
+
+    try:
+        await interaction.delete_original_response()
+    except discord.HTTPException:
+        log.warning(
+            "Delivered reveal but could not remove the deferred response for user=%s",
+            interaction.user.id,
+        )
 
     await asyncio.to_thread(ledger_append, reveal["reveal_id"], interaction.user.id)
 
@@ -595,11 +611,23 @@ class RevealBot(discord.Client):
 
 
 bot = RevealBot()
+bot_ready = threading.Event()
 
 
 @bot.event
 async def on_ready():
+    bot_ready.set()
     log.info("Logged in as %s (%s)", bot.user, bot.user.id if bot.user else "?")
+
+
+@bot.event
+async def on_disconnect():
+    bot_ready.clear()
+
+
+@bot.event
+async def on_resumed():
+    bot_ready.set()
 
 
 @bot.tree.command(name="upload", description="Admin: start an image/video reveal upload.")
@@ -762,8 +790,14 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
 
 async def main():
-    async with bot:
-        await bot.start(TOKEN)
+    health_server = start_health_server(bot_ready.is_set)
+    log.info("Health server listening on 0.0.0.0:%s", health_server.server_port)
+    try:
+        async with bot:
+            await bot.start(TOKEN)
+    finally:
+        health_server.shutdown()
+        health_server.server_close()
 
 
 if __name__ == "__main__":
