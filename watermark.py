@@ -645,10 +645,13 @@ def embed_video(src: Path, dst: Path, user_id: int, key: bytes, reveal_id: str, 
                 max_bpp: float = MAX_BITS_PER_PIXEL) -> dict:
     """Embed a watermark into a Discord/mobile-friendly MP4.
 
-    The encoder prioritizes H.264 Main profile, yuv420p compatibility, no B-frames, short
-    keyframe intervals, AAC audio and +faststart. When a size budget is supplied the
-    bitrate is derived from it (see ``_plan_video_rate``) and VBV-constrained, so the
-    output reliably fits on the first pass. Returns a small dict describing the encode.
+    The encoder uses H.264 Baseline, yuv420p, no B-frames, short keyframe intervals,
+    AAC audio and +faststart. x264 selects the H.264 level from the actual output
+    dimensions, frame rate and bitrate; hard-coding Level 4.0 can mislabel wide
+    videos and cause mobile hardware decoders to reject them. When a size budget is
+    supplied the bitrate is derived from it (see ``_plan_video_rate``) and
+    VBV-constrained, so the output reliably fits on the first pass. Returns a small
+    dict describing the encode.
     """
     del cell
     duration = min(float(max_seconds), max(0.0, _video_duration_seconds(src)))
@@ -687,9 +690,10 @@ def embed_video(src: Path, dst: Path, user_id: int, key: bytes, reveal_id: str, 
                 "-bufsize", str(int(pass_rate * VBV_SECONDS)),
                 # Maximum-compatibility MP4 for Discord's native mobile attachment
                 # player: H.264 Baseline, yuv420p, no B-frames, fixed 1-second GOPs,
-                # closed GOPs, and the avc1 tag. These are deliberately conservative
-                # because the requirement is native mobile playback, not browser playback.
-                "-profile:v", "baseline", "-level", "4.0",
+                # closed GOPs, and the avc1 tag. Let x264 choose the required level:
+                # forcing Level 4.0 mislabels preserved wide frames (for example,
+                # 2560x1080) and can make mobile hardware decoders refuse playback.
+                "-profile:v", "baseline",
                 "-pix_fmt", "yuv420p", "-bf", "0", "-refs", "1",
                 "-g", str(max(1, int(round(fps)))),
                 "-keyint_min", str(max(1, int(round(fps)))),
