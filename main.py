@@ -56,6 +56,7 @@ AUTO_DELETE_OLD_ORIGINALS = os.getenv("AUTO_DELETE_OLD_ORIGINALS", "false").lowe
 
 IMAGE_PREVIEW_MAX_DIM = int(os.getenv("IMAGE_PREVIEW_MAX_DIM", "2048"))
 IMAGE_PREVIEW_QUALITY = int(os.getenv("IMAGE_PREVIEW_QUALITY", "92"))
+IMAGE_CACHE_VERSION = os.getenv("IMAGE_CACHE_VERSION", "mobile-jpeg-v2")
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "/var/data" if Path("/var/data").is_dir() else "data"))
 REVEALS_DIR = DATA_DIR / "reveals"
@@ -381,7 +382,7 @@ def cache_path_for(reveal: dict, user_id: int, target_bytes: Optional[int]) -> P
     if reveal["kind"] == "video":
         target_mb = int(round((target_bytes or 0) / 1048576))
         return base / f"user_{user_id}_{VIDEO_CACHE_VERSION}_{target_mb}mb.mp4"
-    return base / f"user_{user_id}_mobile.jpg"
+    return base / f"user_{user_id}_{IMAGE_CACHE_VERSION}.jpg"
 
 
 def _ready(path: Path) -> bool:
@@ -461,31 +462,33 @@ async def send_personalized_reveal(interaction: discord.Interaction) -> None:
         )
         return
 
-    size_bytes = path.stat().st_size
-    if reveal["kind"] == "video" and upload_limit and size_bytes > upload_limit:
-        await interaction.edit_original_response(
-            content=(
-                f"❌ The personalized video is too large ({size_bytes / 1048576:.1f} MB vs "
-                f"the {upload_limit / 1048576:.1f} MB attachment limit)."
-            ),
-            attachments=[],
-        )
-        return
-
-    filename = "reveal.mp4" if reveal["kind"] == "video" else "reveal.jpg"
-    content = (
-        "🎬 Booster reveal attached below."
-        if reveal["kind"] == "video"
-        else "🖼️ Booster reveal attached below."
-    )
-
-    log.info(
-        "Prepared reveal=%s user=%s kind=%s size=%d cached=%s build_seconds=%.2f",
-        reveal["reveal_id"], interaction.user.id, reveal["kind"], size_bytes,
-        cached, time.perf_counter() - started,
-    )
-
     try:
+        size_bytes = path.stat().st_size
+        if size_bytes <= 0:
+            raise RuntimeError("The generated reveal is empty.")
+        if upload_limit and size_bytes > upload_limit:
+            await interaction.edit_original_response(
+                content=(
+                    f"❌ The personalized file is too large ({size_bytes / 1048576:.1f} MB vs "
+                    f"the {upload_limit / 1048576:.1f} MB attachment limit)."
+                ),
+                attachments=[],
+            )
+            return
+
+        filename = "reveal.mp4" if reveal["kind"] == "video" else "reveal.jpg"
+        content = (
+            "🎬 Booster reveal attached below."
+            if reveal["kind"] == "video"
+            else "🖼️ Booster reveal attached below."
+        )
+
+        log.info(
+            "Prepared reveal=%s user=%s kind=%s size=%d cached=%s build_seconds=%.2f",
+            reveal["reveal_id"], interaction.user.id, reveal["kind"], size_bytes,
+            cached, time.perf_counter() - started,
+        )
+
         # Send the attachment as its own ephemeral follow-up. Discord's mobile
         # clients can fail to initialize inline video playback when a file is
         # added by editing the deferred interaction response.
@@ -501,6 +504,23 @@ async def send_personalized_reveal(interaction: discord.Interaction) -> None:
             "Failed to deliver reveal attachment reveal=%s user=%s",
             reveal["reveal_id"], interaction.user.id,
         )
+        try:
+            # Keep the mobile-friendly follow-up as the normal path. If Discord rejects
+            # that webhook upload (for example because the runtime's application webhook
+            # is unavailable), fall back to the canonical deferred response so the user
+            # still gets a private reveal rather than a dead interaction.
+            if 'path' in locals() and path.exists() and path.stat().st_size > 0 and (
+                not upload_limit or path.stat().st_size <= upload_limit
+            ):
+                with discord.File(path, filename=filename, spoiler=False) as reveal_file:
+                    await interaction.edit_original_response(
+                        content=content,
+                        attachments=[reveal_file],
+                    )
+                await asyncio.to_thread(ledger_append, reveal["reveal_id"], interaction.user.id)
+                return
+        except Exception:
+            log.exception("Canonical reveal delivery fallback failed for user=%s", interaction.user.id)
         try:
             await interaction.edit_original_response(
                 content="❌ I couldn't deliver your personalized reveal. Please try again.",
