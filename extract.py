@@ -13,7 +13,7 @@ p.add_argument("--reveal-id", required=True)
 p.add_argument("--start-frame", type=int, default=0)
 p.add_argument("--image-cell", type=int, default=int(os.getenv("WM_IMAGE_CELL", "4")))
 p.add_argument("--video-cell", type=int, default=int(os.getenv("WM_VIDEO_CELL", "8")))
-p.add_argument("--max-height", type=int, default=int(os.getenv("MAX_VIDEO_HEIGHT", "720")))
+p.add_argument("--max-height", type=int, default=int(os.getenv("MAX_VIDEO_HEIGHT", "1080")))
 args = p.parse_args()
 
 secret = os.getenv("WATERMARK_SECRET")
