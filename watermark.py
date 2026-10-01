@@ -639,26 +639,26 @@ def _delta_planes(y: np.ndarray, bits: np.ndarray, key: bytes, reveal_id: str,
 
 
 def embed_video(src: Path, dst: Path, user_id: int, key: bytes, reveal_id: str, *,
-                amp: float = AMP, cell: int = CELL, preset: str = "veryfast",
+                amp: float = AMP, cell: int = CELL, preset: str = "fast",
                 max_seconds: int = 300, max_height: int = 1080, group: int = VIDEO_GROUP,
                 target_bytes: Optional[int] = None, audio_kbps: int = 96,
                 max_bpp: float = MAX_BITS_PER_PIXEL) -> dict:
     """Embed a watermark into a Discord/mobile-friendly MP4.
 
-    The encoder uses H.264 Baseline, yuv420p, no B-frames, short keyframe intervals,
-    AAC audio and +faststart. x264 selects the H.264 level from the actual output
-    dimensions, frame rate and bitrate; hard-coding Level 4.0 can mislabel wide
-    videos and cause mobile hardware decoders to reject them. When a size budget is
-    supplied the bitrate is derived from it (see ``_plan_video_rate``) and
-    VBV-constrained, so the output reliably fits on the first pass. Returns a small
-    dict describing the encode.
+    A per-user watermark requires re-encoding, so the source bitstream cannot be
+    retained. H.264 High Profile with yuv420p, AAC audio and +faststart is broadly
+    playable on current mobile clients while CABAC, B-frames and 8x8 transforms
+    preserve more detail at a given upload size. x264 selects the H.264 level from
+    the output dimensions, frame rate and bitrate. When a size budget is supplied,
+    the bitrate is derived from it (see ``_plan_video_rate``) and VBV-constrained.
+    Returns encode details.
     """
     del cell
     duration = min(float(max_seconds), max(0.0, _video_duration_seconds(src)))
     if duration <= 0:
         duration = float(max_seconds)
 
-    target = max(2 * 1048576, int(target_bytes)) if target_bytes else None
+    target = max(1, int(target_bytes)) if target_bytes else None
     bits = encode_payload(user_id)
     audio_bps = max(64000, min(128000, int(audio_kbps) * 1000))
 
@@ -669,7 +669,7 @@ def embed_video(src: Path, dst: Path, user_id: int, key: bytes, reveal_id: str, 
     # Same height as the call above in the common case -> served from the probe cache.
     w, h, fps, vf = _probe_video(src, delivery_height)
     fps = min(float(fps), 30.0)
-    gop = max(30, min(60, int(round(fps * 2.0))))
+    gop = max(1, min(120, int(round(fps * 2.0))))
     rate = _plan_video_rate(width=w, height=h, fps=fps, duration=duration, target=target,
                             audio_bps=audio_bps, max_bpp=max_bpp)
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -688,17 +688,15 @@ def embed_video(src: Path, dst: Path, user_id: int, key: bytes, reveal_id: str, 
                 "-c:v", "libx264", "-preset", preset,
                 "-b:v", str(pass_rate), "-maxrate", str(pass_rate),
                 "-bufsize", str(int(pass_rate * VBV_SECONDS)),
-                # Maximum-compatibility MP4 for Discord's native mobile attachment
-                # player: H.264 Baseline, yuv420p, no B-frames, fixed 1-second GOPs,
-                # closed GOPs, and the avc1 tag. Let x264 choose the required level:
-                # forcing Level 4.0 mislabels preserved wide frames (for example,
-                # 2560x1080) and can make mobile hardware decoders refuse playback.
-                "-profile:v", "baseline",
-                "-pix_fmt", "yuv420p", "-bf", "0", "-refs", "1",
-                "-g", str(max(1, int(round(fps)))),
+                # Current iOS/Android decoders support H.264 High Profile. Keep the
+                # widely compatible 8-bit 4:2:0 format and closed GOPs, but avoid
+                # Baseline's compression-efficiency penalty.
+                "-profile:v", "high",
+                "-pix_fmt", "yuv420p", "-bf", "3", "-refs", "3",
+                "-g", str(gop),
                 "-keyint_min", str(max(1, int(round(fps)))),
                 "-sc_threshold", "0",
-                "-x264-params", "aq-mode=1:aq-strength=0.8:rc-lookahead=20:deblock=0,0:repeat-headers=1:aud=1:bframes=0:open-gop=0:8x8dct=0:cabac=0",
+                "-x264-params", "aq-mode=1:aq-strength=0.8:rc-lookahead=30:deblock=0,0:repeat-headers=1:aud=1:bframes=3:open-gop=0:8x8dct=1:cabac=1",
                 "-tag:v", "avc1",
                 "-c:a", "aac", "-b:a", str(audio_bps), "-ar", "48000", "-ac", "2",
                 "-map_metadata", "-1", "-map_chapters", "-1", "-sn", "-dn",
