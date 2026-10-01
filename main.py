@@ -37,11 +37,11 @@ BOOSTER_ROLE_ID = int(os.getenv("BOOSTER_ROLE_ID", "0") or 0)
 MAX_CONCURRENT_JOBS = max(1, int(os.getenv("MAX_CONCURRENT_JOBS", "2")))
 MAX_VIDEO_SECONDS = int(os.getenv("MAX_VIDEO_SECONDS", "300"))
 MAX_VIDEO_HEIGHT = int(os.getenv("MAX_VIDEO_HEIGHT", "1080"))
-VIDEO_PRESET = os.getenv("VIDEO_PRESET", "veryfast")
+VIDEO_PRESET = os.getenv("VIDEO_PRESET", "fast")
 VIDEO_AUDIO_KBPS = int(os.getenv("VIDEO_AUDIO_KBPS", "96"))
-VIDEO_TARGET_MAX_MB = float(os.getenv("VIDEO_TARGET_MAX_MB", "19.5"))
+VIDEO_TARGET_MAX_MB = float(os.getenv("VIDEO_TARGET_MAX_MB", "500"))
 VIDEO_MAX_BPP = float(os.getenv("VIDEO_MAX_BPP", str(wm.MAX_BITS_PER_PIXEL)))
-VIDEO_CACHE_VERSION = f"{os.getenv('VIDEO_CACHE_VERSION', 'v15')}-h264-level-auto-v1"
+VIDEO_CACHE_VERSION = f"{os.getenv('VIDEO_CACHE_VERSION', 'v16')}-h264-high-mobile-v2"
 IMAGE_AMP = float(os.getenv("WM_IMAGE_AMP", "3.0"))
 IMAGE_CELL = int(os.getenv("WM_IMAGE_CELL", "4"))
 VIDEO_AMP = float(os.getenv("WM_VIDEO_AMP", "3.0"))
@@ -184,10 +184,10 @@ def ledger_served(reveal_id: str, user_id: int) -> bool:
 
 def compute_video_target_bytes(upload_limit: Optional[int]) -> int:
     configured = int(VIDEO_TARGET_MAX_MB * 1048576)
-    if not upload_limit:
+    if not upload_limit or upload_limit <= 0:
         return configured
     margin = min(512 * 1024, max(128 * 1024, int(upload_limit * 0.025)))
-    return min(configured, max(4 * 1048576, int(upload_limit) - margin))
+    return min(configured, max(1, int(upload_limit) - margin))
 
 
 def is_allowed_media(filename: str, content_type: Optional[str]) -> tuple[bool, Optional[str], Optional[str]]:
