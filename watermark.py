@@ -46,7 +46,7 @@ RGB2Y = np.array([0.299, 0.587, 0.114], np.float32)
 # huge (slow to encode, upload and load on the client) without any visible gain, so the
 # average bitrate is capped at MAX_BITS_PER_PIXEL (bits per pixel per frame).
 MAX_BITS_PER_PIXEL = 0.11
-MIN_VIDEO_BPS = 350_000
+MIN_VIDEO_BPS = 128_000
 VBV_SECONDS = 1.5          # VBV buffer length; also reserved from the size budget
 CONTAINER_MARGIN = 0.975   # fraction of the size budget the stream may use (mux overhead)
 
