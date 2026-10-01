@@ -1582,4 +1582,4 @@ def extract(
 
     raise ValueError(
         f"Unsupported extraction kind: {kind}"
-    )m
+    )
