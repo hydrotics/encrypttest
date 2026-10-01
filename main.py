@@ -483,40 +483,24 @@ async def send_personalized_reveal(interaction: discord.Interaction) -> None:
         cached, time.perf_counter() - started,
     )
 
-    # Keep the deferred interaction response as a short status message and send the
-    # media as a newly-created ephemeral follow-up. This avoids editing an ephemeral
-    # response into a video attachment, a path that can fail to initialize playback
-    # in some Discord mobile clients. The exact same encoded file is uploaded.
     try:
-        await interaction.followup.send(
+        await interaction.edit_original_response(
             content=content,
-            file=discord.File(path, filename=filename, spoiler=False),
-            ephemeral=True,
-            wait=True,
+            attachments=[discord.File(path, filename=filename, spoiler=False)],
         )
     except Exception:
         log.exception(
             "Failed to deliver reveal attachment reveal=%s user=%s",
             reveal["reveal_id"], interaction.user.id,
         )
-        await interaction.edit_original_response(
-            content="❌ I couldn't deliver your personalized reveal. Please try again.",
-            attachments=[],
-        )
+        try:
+            await interaction.edit_original_response(
+                content="❌ I couldn't deliver your personalized reveal. Please try again.",
+                attachments=[],
+            )
+        except discord.HTTPException:
+            log.exception("Could not update failed reveal response for user=%s", interaction.user.id)
         return
-
-    try:
-        await interaction.edit_original_response(
-            content="✅ Your reveal was sent in the private reply below.",
-            attachments=[],
-        )
-    except discord.HTTPException:
-        # The video has already been delivered; failure to update the status message
-        # should not make the successful upload appear to have failed.
-        log.warning(
-            "Delivered reveal but could not update interaction status reveal=%s user=%s",
-            reveal["reveal_id"], interaction.user.id,
-        )
 
     await asyncio.to_thread(ledger_append, reveal["reveal_id"], interaction.user.id)
 
@@ -658,39 +642,24 @@ async def add_reveal_button(interaction: discord.Interaction, message: discord.M
     if not interaction.user.guild_permissions.manage_guild:
         await interaction.response.send_message("You need the Manage Server permission to add reveal buttons.", ephemeral=True)
         return
-    if not bot.user or message.author.id != bot.user.id:
+    try:
+        await message.reply(
+            content="👁️ Booster reveal — tap the button below to open your private reveal.",
+            view=RevealButtonView(),
+            mention_author=False,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except discord.HTTPException as exc:
+        log.exception("Could not post reveal button reply to message %s", message.id)
         await interaction.response.send_message(
-            "I can only edit messages sent by this bot, because Discord does not let bots edit other users' messages.",
+            "I couldn't reply with the reveal button. Check that I can view the channel and send messages there.",
             ephemeral=True,
         )
         return
-
-    if message.components:
-        try:
-            existing_ids = {
-                getattr(item, "custom_id", None)
-                for row in message.components
-                for item in getattr(row, "children", ())
-            }
-        except Exception:
-            existing_ids = set()
-        if "revealbot:view-reveal:v1" in existing_ids:
-            await interaction.response.send_message("That message already has a Reveal button.", ephemeral=True)
-        else:
-            await interaction.response.send_message(
-                "I left that message unchanged because it already has components; this avoids replacing another button/view. "
-                "Use the app on a bot message without components.",
-                ephemeral=True,
-            )
-        return
-
-    try:
-        await message.edit(view=RevealButtonView())
-    except discord.HTTPException as exc:
-        log.exception("Could not add reveal button to message %s", message.id)
-        await interaction.response.send_message(f"I couldn't edit that message: {exc}", ephemeral=True)
-        return
-    await interaction.response.send_message("✅ Added the View Reveal button to that message.", ephemeral=True)
+    await interaction.response.send_message(
+        "✅ Posted a View Reveal button as a reply to the selected message.",
+        ephemeral=True,
+    )
 
 
 bot.tree.add_command(add_reveal_button)
