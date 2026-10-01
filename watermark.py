@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import io
+import itertools
 import re
 import subprocess
 import tempfile
@@ -30,7 +31,7 @@ VIDEO_GROUP = 8
 MATCH_H = 360
 COARSE_H = 240
 VIDEO_MAX_FPS = 30.0
-TRACE_COARSE_FPS = 0.5
+TRACE_COARSE_FPS = 1.0
 TRACE_MAX_SAMPLES = 180
 
 _x, _y = np.mgrid[:CELL, :CELL].astype(np.float32)
@@ -40,6 +41,18 @@ _CARRIER = (
 ).astype(np.float32)
 _CARRIER /= np.sqrt(np.mean(_CARRIER * _CARRIER)) + 1e-8
 RGB2Y = np.array([0.299, 0.587, 0.114], np.float32)
+
+# Video rate control. Spending a whole upload budget on a short clip makes the file
+# huge (slow to encode, upload and load on the client) without any visible gain, so the
+# average bitrate is capped at MAX_BITS_PER_PIXEL (bits per pixel per frame).
+MAX_BITS_PER_PIXEL = 0.11
+MIN_VIDEO_BPS = 350_000
+VBV_SECONDS = 1.5          # VBV buffer length; also reserved from the size budget
+CONTAINER_MARGIN = 0.975   # fraction of the size budget the stream may use (mux overhead)
+
+# Images are watermarked in horizontal strips of this many cell rows so peak memory
+# stays flat instead of scaling with float32 copies of the whole picture.
+IMAGE_STRIP_CELLS = 24
 
 
 def get_ffmpeg() -> str:
@@ -57,11 +70,31 @@ def encode_payload(user_id: int) -> np.ndarray:
 
 
 def decode_payload(scores: np.ndarray) -> tuple[int, bool]:
+    """Decode the legacy 96-bit payload, correcting a few weak bit errors via CRC."""
+    bits = (np.asarray(scores) > 0).astype(np.uint8)
     value = 0
-    for score in scores:
-        value = (value << 1) | int(score > 0)
+    for bit in bits:
+        value = (value << 1) | int(bit)
     uid = value >> 32
-    return uid, zlib.crc32(uid.to_bytes(8, "big")) == (value & 0xFFFFFFFF)
+    if zlib.crc32(uid.to_bytes(8, "big")) == (value & 0xFFFFFFFF):
+        return uid, True
+
+    weak = np.argsort(np.abs(np.asarray(scores)))[:12]
+    if len(weak) < 2:
+        return uid, False
+
+    # Old embeds stay byte-for-byte compatible: this only changes extraction.
+    for flips in (1, 2, 3):
+        for idxs in itertools.combinations(weak.tolist(), flips):
+            test = bits.copy()
+            test[list(idxs)] ^= 1
+            value = 0
+            for bit in test:
+                value = (value << 1) | int(bit)
+            uid = value >> 32
+            if zlib.crc32(uid.to_bytes(8, "big")) == (value & 0xFFFFFFFF):
+                return uid, True
+    return uid, False
 
 
 def _seed(key: bytes, *parts) -> int:
@@ -195,48 +228,62 @@ def _sift(g: np.ndarray, nfeatures: int = 1000):
 def _homography_candidates(orig_rgb: np.ndarray, leak_rgb: np.ndarray) -> list[tuple[np.ndarray, float, str]]:
     og, os = _feature_image(orig_rgb)
     lg, ls = _feature_image(leak_rgb)
-    okp, od = _sift(og)
-    lkp, ld = _sift(lg)
+    okp, od = _sift(og, 1600)
+    lkp, ld = _sift(lg, 1600)
     if od is None or ld is None or len(okp) < 10 or len(lkp) < 10:
         return []
 
     knn = cv2.BFMatcher(cv2.NORM_L2).knnMatch(ld, od, k=2)
-    good = [a for a, b in knn if a.distance < 0.78 * b.distance]
-    if len(good) < 8:
-        return []
-
-    src = np.float32([lkp[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-    dst = np.float32([okp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
     out: list[tuple[np.ndarray, float, str]] = []
+    So = np.diag([1 / os, 1 / os, 1.0])
+    Sl = np.diag([ls, ls, 1.0])
 
-    for threshold in (2.5, 4.0, 6.0, 9.0):
-        Hs, mask = cv2.findHomography(src, dst, cv2.RANSAC, threshold, maxIters=4000, confidence=0.995)
-        if Hs is not None:
-            inliers = int(mask.sum()) if mask is not None else 0
-            if inliers >= 7:
-                So = np.diag([1 / os, 1 / os, 1.0])
-                Sl = np.diag([ls, ls, 1.0])
-                H = So @ Hs @ Sl
-                out.append((H, inliers / max(len(good), 1), f"sift-r{threshold:g}"))
+    for ratio in (0.72, 0.78, 0.84):
+        good = [a for a, b in knn if a.distance < ratio * b.distance]
+        if len(good) < 8:
+            continue
+        src = np.float32([lkp[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+        dst = np.float32([okp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+        for threshold in (2.5, 4.0, 7.0):
+            Hs, mask = cv2.findHomography(src, dst, cv2.RANSAC, threshold, maxIters=5000, confidence=0.998)
+            if Hs is not None:
+                inliers = int(mask.sum()) if mask is not None else 0
+                if inliers >= 7:
+                    out.append((So @ Hs @ Sl, inliers / max(len(good), 1),
+                                f"sift-{ratio:.2f}-r{threshold:g}"))
 
-    # Affine fallback is often more stable than an overfit homography on video frames.
-    A, mask = cv2.estimateAffinePartial2D(src, dst, method=cv2.RANSAC, ransacReprojThreshold=4.0,
-                                          maxIters=4000, confidence=0.995)
-    if A is not None and mask is not None and int(mask.sum()) >= 7:
-        Ah = np.vstack([A, [0, 0, 1]]).astype(np.float64)
-        So = np.diag([1 / os, 1 / os, 1.0])
-        Sl = np.diag([ls, ls, 1.0])
-        H = So @ Ah @ Sl
-        out.append((H, int(mask.sum()) / max(len(good), 1), "affine"))
+        A, mask = cv2.estimateAffinePartial2D(
+            src, dst, method=cv2.RANSAC, ransacReprojThreshold=4.0,
+            maxIters=5000, confidence=0.998
+        )
+        if A is not None and mask is not None and int(mask.sum()) >= 7:
+            Ah = np.vstack([A, [0, 0, 1]]).astype(np.float64)
+            out.append((So @ Ah @ Sl, int(mask.sum()) / max(len(good), 1),
+                        f"affine-{ratio:.2f}"))
 
-    # Deduplicate near-identical transforms.
+    # ORB fallback helps when SIFT is unavailable/weak after heavy recompression.
+    if not out:
+        okp, od = _orb(og, 1400)
+        lkp, ld = _orb(lg, 1400)
+        if od is not None and ld is not None and len(okp) >= 10 and len(lkp) >= 10:
+            knn = cv2.BFMatcher(cv2.NORM_HAMMING).knnMatch(ld, od, k=2)
+            good = [a for a, b in knn if a.distance < 0.80 * b.distance]
+            if len(good) >= 8:
+                src = np.float32([lkp[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+                dst = np.float32([okp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+                Hs, mask = cv2.findHomography(src, dst, cv2.RANSAC, 6.0, maxIters=5000, confidence=0.995)
+                if Hs is not None:
+                    inliers = int(mask.sum()) if mask is not None else 0
+                    if inliers >= 7:
+                        out.append((So @ Hs @ Sl, inliers / max(len(good), 1), "orb"))
+
     unique: list[tuple[np.ndarray, float, str]] = []
     for item in sorted(out, key=lambda x: x[1], reverse=True):
         H = item[0]
-        if any(np.max(np.abs(H - u[0])) < 0.02 * max(1.0, np.max(np.abs(H))) for u in unique):
+        if any(np.max(np.abs(H - u[0])) < 0.015 * max(1.0, np.max(np.abs(H))) for u in unique):
             continue
         unique.append(item)
-        if len(unique) >= 6:
+        if len(unique) >= 8:
             break
     return unique
 
@@ -282,7 +329,7 @@ def _warp(leak: np.ndarray, H: np.ndarray, out_shape: tuple[int, int]) -> tuple[
 
 
 def _geometry_variants(H: np.ndarray) -> list[np.ndarray]:
-    """Small sub-pixel/registration perturbations for screenshots and social encoders."""
+    """Registration jitter for crop, rescale, rotation and encoder rounding."""
     out = [H.copy()]
     for tx in (-2.0, -1.0, -0.35, 0.35, 1.0, 2.0):
         for ty in (-2.0, -1.0, 0.0, 1.0, 2.0):
@@ -291,11 +338,15 @@ def _geometry_variants(H: np.ndarray) -> list[np.ndarray]:
             M[1, 2] += ty
             out.append(M)
     for sx, sy in ((0.995, 1), (1.005, 1), (1, 0.995), (1, 1.005),
-                   (0.99, 0.99), (1.01, 1.01)):
+                   (0.99, 0.99), (1.01, 1.01), (0.985, 1.015), (1.015, 0.985)):
         M = H.copy()
         M[0, :3] *= sx
         M[1, :3] *= sy
         out.append(M)
+    for deg in (-1.0, -0.5, 0.5, 1.0):
+        c, s = np.cos(np.deg2rad(deg)), np.sin(np.deg2rad(deg))
+        R = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], np.float64)
+        out.append(R @ H)
     return out
 
 
@@ -303,33 +354,84 @@ def _decode_registered(oy: np.ndarray, leak_y: np.ndarray, key: bytes, reveal_id
                        group: int, Hs: list[np.ndarray]) -> tuple[Optional[int], float, np.ndarray]:
     best_metric = -1e9
     best_scores = np.zeros(N_BITS, np.float64)
+    votes: dict[int, list[float]] = {}
     for H in Hs:
         warped, mask = _warp(leak_y, H, oy.shape)
-        scores = _score(oy, warped, key, reveal_id, group, mask)
-        uid, ok = decode_payload(scores)
-        metric = float(np.mean(np.abs(scores)))
-        if ok:
-            return uid, metric, scores
-        if metric > best_metric:
-            best_metric = metric
-            best_scores = scores
+        for candidate in (warped, cv2.GaussianBlur(warped, (3, 3), 0)):
+            scores = _score(oy, candidate, key, reveal_id, group, mask)
+            uid, ok = decode_payload(scores)
+            metric = float(np.mean(np.abs(scores)))
+            if metric > best_metric:
+                best_metric, best_scores = metric, scores
+            if ok:
+                votes.setdefault(int(uid), []).append(metric)
+
+    if votes:
+        uid, metrics = max(votes.items(), key=lambda item: (len(item[1]), sum(item[1])))
+        # A CRC hit is already strong; requiring two independent hypotheses only when
+        # several competing IDs appear avoids false positives without hurting real leaks.
+        if len(votes) == 1 or len(metrics) >= 2:
+            return uid, float(np.mean(metrics)), best_scores
     return None, best_metric, best_scores
+
+
+def embed_image_array(rgb: np.ndarray, user_id: int, key: bytes, reveal_id: str,
+                      amp: float = AMP) -> np.ndarray:
+    """Watermark an (h, w, 3) uint8 image and return a new uint8 array.
+
+    Works in strips of IMAGE_STRIP_CELLS cell-rows. Strips start on a cell boundary and
+    every cell is independent, so the result matches whole-image processing while peak
+    memory stays small (the old code held several float32 copies of the full image,
+    ~0.6 GB for 12 MP and over 1 GB for a 24 MP phone photo).
+    """
+    h, w = rgb.shape[:2]
+    ch, cw = _grid(h, w)
+    cell_bits = encode_payload(user_id)[_layout(key, reveal_id, h, w)] * _chips(key, reveal_id, 0, ch, cw)
+    out = np.empty((h, w, 3), np.uint8)
+    for r0 in range(0, ch, IMAGE_STRIP_CELLS):
+        r1 = min(ch, r0 + IMAGE_STRIP_CELLS)
+        y0, y1 = r0 * CELL, min(h, r1 * CELL)
+        strip = rgb[y0:y1].astype(np.float32)
+        cells = cell_bits[r0:r1] * _texture(strip @ RGB2Y)
+        d = (cells[:, :, None, None] * _CARRIER[None, None] * float(amp))
+        d = d.transpose(0, 2, 1, 3).reshape((r1 - r0) * CELL, cw * CELL)[: y1 - y0, :w]
+        out[y0:y1] = np.clip(strip + d[..., None], 0, 255).astype(np.uint8)
+    return out
+
+
+def _save_image(img: Image.Image, dst: Path) -> None:
+    suffix = dst.suffix.lower()
+    if suffix in (".jpg", ".jpeg"):
+        img.save(dst, "JPEG", quality=95, subsampling=0)
+    elif suffix == ".webp":
+        img.save(dst, "WEBP", lossless=True)
+    else:
+        img.save(dst, "PNG", compress_level=4)
 
 
 def embed_image(src: Path, dst: Path, user_id: int, key: bytes, reveal_id: str,
                 amp: float = AMP, cell: int = CELL) -> None:
+    """Write a full-resolution watermarked copy of `src` to `dst`."""
     del cell  # fixed robust layout; compatibility with older bot configuration
-    rgb = np.asarray(_load_rgb(src), np.float32)
-    y = rgb @ RGB2Y
-    delta = _delta(y, encode_payload(user_id), key, reveal_id, 0, amp)
-    out = Image.fromarray(np.clip(rgb + delta[..., None], 0, 255).astype(np.uint8), "RGB")
-    suffix = dst.suffix.lower()
-    if suffix in (".jpg", ".jpeg"):
-        out.save(dst, "JPEG", quality=95, subsampling=0)
-    elif suffix == ".webp":
-        out.save(dst, "WEBP", lossless=True)
-    else:
-        out.save(dst, "PNG", compress_level=4)
+    rgb = np.asarray(_load_rgb(src), np.uint8)
+    _save_image(Image.fromarray(embed_image_array(rgb, user_id, key, reveal_id, amp)), dst)
+
+
+def render_image_preview(src: Path, preview: Path, user_id: int, key: bytes, reveal_id: str, *,
+                         amp: float = AMP, max_dim: int = 2048, quality: int = 88) -> None:
+    """Watermark at full resolution, then write only the baseline JPEG that gets delivered.
+
+    The watermark is embedded before downscaling (as before), but the full-resolution
+    personalized copy is never encoded to disk: nothing consumed it, and PNG-encoding it
+    was the single slowest step of an image reveal.
+    """
+    rgb = np.asarray(_load_rgb(src), np.uint8)
+    img = Image.fromarray(embed_image_array(rgb, user_id, key, reveal_id, amp))
+    del rgb
+    img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
+    preview.parent.mkdir(parents=True, exist_ok=True)
+    img.save(preview, "JPEG", quality=max(70, min(95, int(quality))),
+             optimize=True, progressive=False, subsampling=2)
 
 
 def extract_image(orig: Path, leak: Path, key: bytes, reveal_id: str, cell: int = CELL) -> dict:
@@ -354,13 +456,35 @@ def extract_image(orig: Path, leak: Path, key: bytes, reveal_id: str, cell: int 
             "registration_score": round(reg, 3), "watermark_metric": round(metric, 4)}
 
 
-def _probe_video(src: Path, max_height: int):
-    """Probe and normalize video settings used by both embed and extraction."""
-    ff = get_ffmpeg()
-    info = subprocess.run(
-        [ff, "-hide_banner", "-i", str(src)],
-        capture_output=True, text=True, timeout=30,
+def _scale_filter(height: int, flags: str) -> str:
+    """Cap height, keep aspect ratio, force even dimensions and square pixels."""
+    return rf"scale=-2:trunc(min(ih\,{int(height)})/2)*2:flags={flags},setsar=1"
+
+
+def _file_sig(path: Path) -> tuple[str, int, int]:
+    """Cache key that changes whenever the file on disk changes."""
+    p = Path(path)
+    st = p.stat()
+    return str(p), st.st_mtime_ns, st.st_size
+
+
+@lru_cache(maxsize=64)
+def _ffmpeg_info_cached(path: str, mtime_ns: int, size: int) -> str:
+    del mtime_ns, size  # part of the cache key only
+    return subprocess.run(
+        [get_ffmpeg(), "-hide_banner", "-i", path],
+        capture_output=True, text=True, errors="replace", timeout=30,
     ).stderr
+
+
+def _ffmpeg_info(src: Path) -> str:
+    """`ffmpeg -i` banner text (streams, fps, duration), probed once per file."""
+    return _ffmpeg_info_cached(*_file_sig(src))
+
+
+@lru_cache(maxsize=64)
+def _probe_video_cached(path: str, mtime_ns: int, size: int, max_height: int):
+    info = _ffmpeg_info_cached(path, mtime_ns, size)
     fps = None
     for pattern in (
         r"(\d+(?:\.\d+)?)(?:/(\d+(?:\.\d+)?))?\s*fps",
@@ -378,9 +502,9 @@ def _probe_video(src: Path, max_height: int):
     # Normalize high-FPS sources. The same normalized FPS is used when tracing.
     fps = min(fps, VIDEO_MAX_FPS)
     max_height = max(144, int(max_height))
-    vf = rf"fps={fps:.6f},scale=-2:trunc(min(ih\,{max_height})/2)*2:flags=lanczos"
+    vf = f"fps={fps:.6f}," + _scale_filter(max_height, "lanczos")
     probe = subprocess.run(
-        [ff, "-hide_banner", "-loglevel", "error", "-i", str(src), "-vf", vf,
+        [get_ffmpeg(), "-hide_banner", "-loglevel", "error", "-i", path, "-vf", vf,
          "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"],
         capture_output=True, timeout=45,
     )
@@ -390,6 +514,22 @@ def _probe_video(src: Path, max_height: int):
     with Image.open(io.BytesIO(probe.stdout)) as im:
         w, h = im.size
     return w, h, fps, vf
+
+
+def _probe_video(src: Path, max_height: int):
+    """Probe and normalize video settings used by both embed and extraction.
+
+    Results are cached per (file, height): embedding used to re-probe the same file
+    five or more times, each probe launching ffmpeg and decoding a frame.
+    """
+    return _probe_video_cached(*_file_sig(src), int(max_height))
+
+
+def video_info(src: Path, max_height: int = 1080) -> dict:
+    """Validate a video and return basic facts. Raises RuntimeError if undecodable."""
+    w, h, fps, _ = _probe_video(src, max_height)
+    return {"width": w, "height": h, "fps": round(fps, 3), "duration": round(_video_duration_seconds(src), 2)}
+
 
 def _read_full(stream, buf) -> bool:
     view, got = memoryview(buf), 0
@@ -423,12 +563,7 @@ def _iter_frames(src: Path, vf: str, w: int, h: int, *, skip: int = 0,
 
 
 def _video_duration_seconds(src: Path) -> float:
-    ff = get_ffmpeg()
-    info = subprocess.run(
-        [ff, "-hide_banner", "-i", str(src)],
-        capture_output=True, text=True, timeout=30,
-    ).stderr
-    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", info)
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", _ffmpeg_info(src))
     if not m:
         return 0.0
     return float(m.group(1)) * 3600.0 + float(m.group(2)) * 60.0 + float(m.group(3))
@@ -467,95 +602,119 @@ def _adaptive_video_height(source_width: int, source_height: int, duration: floa
     return min(360, ceiling)
 
 
-def embed_video(src: Path, dst: Path, user_id: int, key: bytes, reveal_id: str, *,
-                amp: float = AMP, cell: int = CELL, crf: int = 18, preset: str = "faster",
-                max_seconds: int = 300, max_height: int = 1080, group: int = VIDEO_GROUP,
-                target_bytes: Optional[int] = None, audio_kbps: int = 96) -> None:
-    """Embed a watermark into a Discord/mobile-friendly MP4 without throwing away detail.
+def _plan_video_rate(*, width: int, height: int, fps: float, duration: float,
+                     target: Optional[int], audio_bps: int, max_bpp: float) -> int:
+    """Average video bitrate (bps) for the encode.
 
-    Native Discord delivery is intentionally used by the bot. This encoder therefore
-    prioritizes H.264 High profile efficiency, yuv420p compatibility, B-frames/reference
-    frames for quality-per-bit, short-ish keyframe intervals, AAC audio and +faststart.
-    When an attachment-size budget is supplied, the video bitrate is calculated from that
-    exact budget instead of relying on a low-quality CRF/maxrate compromise.
+    * With a size budget the rate is solved so the *worst case* stream (average rate for
+      the whole clip plus a full VBV buffer) still fits, so the first pass is accepted
+      instead of being thrown away and re-encoded.
+    * The rate is also capped at ``max_bpp`` bits/pixel/frame: past that point H.264 gets
+      bigger, not better, and short clips would otherwise balloon to the full upload limit.
+    """
+    if target:
+        budget_bits = target * 8 * CONTAINER_MARGIN - audio_bps * duration
+        rate = budget_bits / (max(duration, 1.0) + VBV_SECONDS)
+    elif height >= 900:
+        rate = 9_000_000
+    elif height >= 700:
+        rate = 6_500_000
+    else:
+        rate = 4_000_000
+    if max_bpp > 0:
+        rate = min(rate, width * height * max(fps, 1.0) * max_bpp)
+    return max(MIN_VIDEO_BPS, int(rate))
+
+
+def _delta_planes(y: np.ndarray, bits: np.ndarray, key: bytes, reveal_id: str,
+                  group: int, amp: float) -> tuple[np.ndarray, np.ndarray]:
+    """Per-group watermark as (add, subtract) uint8 planes for saturating arithmetic.
+
+    ``clip(y + d, 0, 255)`` is exactly ``subtract(add(y, max(d, 0)), max(-d, 0))`` with
+    saturation, and the OpenCV saturating ops are in-place SIMD instead of the three
+    full-frame int16 temporaries numpy needed per frame.
+    """
+    d = np.rint(_delta(y.astype(np.float32), bits, key, reveal_id, group, amp)).astype(np.int16)
+    return (np.clip(d, 0, 255).astype(np.uint8), np.clip(-d, 0, 255).astype(np.uint8))
+
+
+def embed_video(src: Path, dst: Path, user_id: int, key: bytes, reveal_id: str, *,
+                amp: float = AMP, cell: int = CELL, preset: str = "veryfast",
+                max_seconds: int = 300, max_height: int = 1080, group: int = VIDEO_GROUP,
+                target_bytes: Optional[int] = None, audio_kbps: int = 96,
+                max_bpp: float = MAX_BITS_PER_PIXEL) -> dict:
+    """Embed a watermark into a Discord/mobile-friendly MP4.
+
+    The encoder prioritizes H.264 Main profile, yuv420p compatibility, no B-frames, short
+    keyframe intervals, AAC audio and +faststart. When a size budget is supplied the
+    bitrate is derived from it (see ``_plan_video_rate``) and VBV-constrained, so the
+    output reliably fits on the first pass. Returns a small dict describing the encode.
     """
     del cell
-    ff = get_ffmpeg()
     duration = min(float(max_seconds), max(0.0, _video_duration_seconds(src)))
     if duration <= 0:
         duration = float(max_seconds)
 
-    # Keep enough headroom for Discord's attachment limit and metadata/audio overhead.
-    target = int(target_bytes) if target_bytes else None
-    if target:
-        target = max(2 * 1048576, target)
-
+    target = max(2 * 1048576, int(target_bytes)) if target_bytes else None
     bits = encode_payload(user_id)
-    source_w, source_h, source_fps, _ = _probe_video(src, max_height)
     audio_bps = max(64000, min(128000, int(audio_kbps) * 1000))
+
+    source_w, source_h, source_fps, _ = _probe_video(src, max_height)
     delivery_height = _adaptive_video_height(
         source_w, source_h, duration, max_height, target, audio_bps, source_fps
     )
+    # Same height as the call above in the common case -> served from the probe cache.
     w, h, fps, vf = _probe_video(src, delivery_height)
     fps = min(float(fps), 30.0)
-    gop = max(48, min(72, int(round(fps * 2.0))))
+    gop = max(30, min(60, int(round(fps * 2.0))))
+    rate = _plan_video_rate(width=w, height=h, fps=fps, duration=duration, target=target,
+                            audio_bps=audio_bps, max_bpp=max_bpp)
     dst.parent.mkdir(parents=True, exist_ok=True)
 
-    # For native Discord attachments, derive an average video bitrate from the actual
-    # upload budget. This is the key quality fix: the old CRF+VBV setup often encoded
-    # long clips far below what the 20 MiB budget could actually sustain.
-    if target:
-        usable_bits = max(1, int(target * 8 * 0.965) - int(audio_bps * duration))
-        avg_video_bps = max(350_000, int(usable_bits / max(duration, 1.0)))
-        maxrate = int(avg_video_bps * 1.12)
-        bufsize = max(2_000_000, int(avg_video_bps * 2.4))
-    else:
-        if h >= 900:
-            avg_video_bps = 9_000_000
-        elif h >= 700:
-            avg_video_bps = 6_500_000
-        else:
-            avg_video_bps = 4_000_000
-        maxrate = int(avg_video_bps * 1.20)
-        bufsize = max(2_000_000, int(avg_video_bps * 2.4))
-
-    def encode_once(out_path: Path, pass_crf: int, pass_height: int, pass_rate: int) -> int:
-        pw, ph, pfps, pvf = _probe_video(src, pass_height)
+    def encode_once(out_path: Path, pass_rate: int) -> int:
         err = tempfile.TemporaryFile()
         enc = subprocess.Popen(
             [
-                ff, "-hide_banner", "-loglevel", "error", "-y",
-                "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", f"{pw}x{ph}",
-                "-framerate", f"{pfps:.6f}", "-i", "-",
-                "-i", str(src),
+                get_ffmpeg(), "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", f"{w}x{h}",
+                "-framerate", f"{fps:.6f}", "-i", "-",
+                # Audio-only second input, limited to the clip length: without -vn/-t
+                # FFmpeg demuxes the entire source a second time just to find the audio.
+                "-vn", "-t", f"{duration:.3f}", "-i", str(src),
                 "-map", "0:v:0", "-map", "1:a:0?",
                 "-c:v", "libx264", "-preset", preset,
-                "-b:v", str(pass_rate), "-maxrate", str(max(pass_rate + 1, int(pass_rate * 1.12))),
-                "-bufsize", str(max(int(pass_rate * 2.4), 2_000_000)),
-                "-profile:v", "high", "-level", "4.1",
-                "-pix_fmt", "yuv420p", "-bf", "2", "-refs", "3",
-                "-g", str(gop), "-keyint_min", str(max(24, gop // 2)), "-sc_threshold", "40",
-                "-x264-params", "aq-mode=2:aq-strength=1.0:rc-lookahead=30:deblock=0,0",
+                "-b:v", str(pass_rate), "-maxrate", str(pass_rate),
+                "-bufsize", str(int(pass_rate * VBV_SECONDS)),
+                # Maximum-compatibility MP4 for Discord's native mobile attachment
+                # player: H.264 Baseline, yuv420p, no B-frames, fixed 1-second GOPs,
+                # closed GOPs, and the avc1 tag. These are deliberately conservative
+                # because the requirement is native mobile playback, not browser playback.
+                "-profile:v", "baseline", "-level", "4.0",
+                "-pix_fmt", "yuv420p", "-bf", "0", "-refs", "1",
+                "-g", str(max(1, int(round(fps)))),
+                "-keyint_min", str(max(1, int(round(fps)))),
+                "-sc_threshold", "0",
+                "-x264-params", "aq-mode=1:aq-strength=0.8:rc-lookahead=20:deblock=0,0:repeat-headers=1:aud=1:bframes=0:open-gop=0:8x8dct=0:cabac=0",
                 "-tag:v", "avc1",
                 "-c:a", "aac", "-b:a", str(audio_bps), "-ar", "48000", "-ac", "2",
                 "-map_metadata", "-1", "-map_chapters", "-1", "-sn", "-dn",
                 "-avoid_negative_ts", "make_zero", "-movflags", "+faststart",
-                "-t", str(duration), str(out_path),
+                "-t", f"{duration:.3f}", str(out_path),
             ],
             stdin=subprocess.PIPE, stderr=err, bufsize=1024 * 1024,
         )
         frames = 0
-        rc = 1
         cached_group = -1
-        group_delta = None
+        add_plane = sub_plane = None
         try:
-            for i, buf in _iter_frames(src, pvf, pw, ph, max_seconds=max_seconds):
+            for i, buf in _iter_frames(src, vf, w, h, max_seconds=max_seconds):
                 group_idx = i // max(1, group)
-                y = np.frombuffer(buf, np.uint8, count=pw * ph).reshape(ph, pw)
+                y = np.frombuffer(buf, np.uint8, count=w * h).reshape(h, w)
                 if group_idx != cached_group:
-                    group_delta = np.rint(_delta(y.astype(np.float32), bits, key, reveal_id, group_idx, amp))
+                    add_plane, sub_plane = _delta_planes(y, bits, key, reveal_id, group_idx, amp)
                     cached_group = group_idx
-                y[:] = np.clip(y.astype(np.int16) + group_delta, 0, 255).astype(np.uint8)
+                cv2.add(y, add_plane, dst=y)
+                cv2.subtract(y, sub_plane, dst=y)
                 try:
                     enc.stdin.write(buf)
                 except BrokenPipeError:
@@ -569,7 +728,6 @@ def embed_video(src: Path, dst: Path, user_id: int, key: bytes, reveal_id: str, 
         except subprocess.TimeoutExpired:
             enc.kill()
             enc.wait()
-            rc = 1
             raise RuntimeError("FFmpeg video encode timed out.")
         finally:
             if enc.poll() is None:
@@ -582,31 +740,27 @@ def embed_video(src: Path, dst: Path, user_id: int, key: bytes, reveal_id: str, 
             raise RuntimeError("FFmpeg encode failed" + (f": {error_text}" if error_text else "."))
         return frames
 
+    # The VBV-constrained first pass fits the budget in practice. The slower retry exists
+    # only as a safety net for pathological input / muxer overshoot.
+    attempts = [rate] + ([max(MIN_VIDEO_BPS, int(rate * 0.82))] if target else [])
     last_size = 0
-    # First pass: spend essentially the whole native Discord upload budget.
-    attempts = [(1, delivery_height, avg_video_bps)]
-    # A small fallback handles hard-to-compress footage or mux overhead overshoot.
-    if target:
-        attempts.append((2, delivery_height, max(350_000, int(avg_video_bps * 0.92))))
-        if delivery_height > 480:
-            attempts.append((3, max(480, delivery_height - 72), max(350_000, int(avg_video_bps * 0.95))))
-
-    for attempt_no, attempt_height, attempt_rate in attempts:
+    for attempt_no, attempt_rate in enumerate(attempts, 1):
         tmp_out = dst.with_name(f"{dst.stem}.encode{attempt_no}.tmp{dst.suffix}")
         try:
-            encode_once(tmp_out, int(crf), attempt_height, attempt_rate)
+            encode_once(tmp_out, attempt_rate)
             last_size = tmp_out.stat().st_size
             if not target or last_size <= target:
                 tmp_out.replace(dst)
-                return
+                return {"width": w, "height": h, "fps": round(fps, 3), "bitrate": attempt_rate,
+                        "attempts": attempt_no, "size": last_size}
         finally:
-            if tmp_out.exists():
-                tmp_out.unlink(missing_ok=True)
+            tmp_out.unlink(missing_ok=True)
 
     raise RuntimeError(
         f"Video could not be encoded below the delivery limit ({last_size / 1048576:.1f} MiB generated, "
         f"target {target / 1048576:.1f} MiB)."
     )
+
 
 def _decode_rgb_frame(buf: bytearray, w: int, h: int) -> np.ndarray:
     # yuv420p -> grayscale using Y plane; keeps extraction fast and stable.
@@ -642,7 +796,7 @@ def _coarse_frames(src: Path, max_height: int, sample_fps: float = TRACE_COARSE_
     sf = min(rate, fps)
     if duration > 0:
         max_samples = min(max(int(max_samples), 24), max(24, int(np.ceil(duration * sf)) + 2))
-    svf = f"fps={sf:.6f},scale=-2:trunc(min(ih\,{COARSE_H})/2)*2:flags=bilinear"
+    svf = f"fps={sf:.6f}," + _scale_filter(COARSE_H, "bilinear")
     scale_factor = min(1.0, COARSE_H / h)
     sw = max(64, round(w * scale_factor) // 2 * 2)
     sh = max(32, round(h * scale_factor) // 2 * 2)
@@ -800,9 +954,8 @@ def extract_video_frame(orig: Path, leak: Path, key: bytes, reveal_id: str, *,
         lkp, ld = _orb(lg, 900)
         if ld is None:
             raise RuntimeError("Could not analyze leaked frame.")
-        matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
         sf = min(2.0, fps)
-        svf = f"fps={sf:.6f},scale=-2:trunc(min(ih\\,{COARSE_H})/2)*2:flags=bilinear"
+        svf = f"fps={sf:.6f}," + _scale_filter(COARSE_H, "bilinear")
         sw = max(64, round(w * min(1.0, COARSE_H / h)) // 2 * 2)
         sh = max(32, round(h * min(1.0, COARSE_H / h)) // 2 * 2)
         coarse = []
@@ -847,7 +1000,7 @@ def _sample_fullres_indices(src: Path, max_height: int, indices: list[int], samp
         return {}, 0.0, 0, 0
     w, h, fps, vf = _probe_video(src, max_height)
     sf = min(max(sample_fps, 0.5), 4.0, fps)
-    svf = rf"fps={sf:.6f},scale=-2:trunc(min(ih\,{max_height})/2)*2:flags=lanczos"
+    svf = f"fps={sf:.6f}," + _scale_filter(max_height, "lanczos")
     wanted = set(int(i) for i in indices)
     frames = {}
     max_idx = max(wanted)
@@ -866,7 +1019,7 @@ def _read_frame_at_time(src: Path, max_height: int, timestamp: float) -> Optiona
     # a few tens of milliseconds, and this avoids decoding the whole video repeatedly.
     proc = subprocess.run(
         [ff, "-hide_banner", "-loglevel", "error", "-ss", f"{ts:.4f}", "-i", str(src),
-         "-frames:v", "1", "-vf", rf"scale=-2:trunc(min(ih\,{max_height})/2)*2:flags=lanczos",
+         "-frames:v", "1", "-vf", _scale_filter(max_height, "lanczos"),
          "-f", "rawvideo", "-pix_fmt", "gray", "-"],
         capture_output=True, timeout=20,
     )
@@ -1014,7 +1167,7 @@ def extract_video(orig: Path, leak: Path, key: bytes, reveal_id: str, *,
         raise RuntimeError("Could not sample video frames.")
 
     a, b, anchors = _best_time_map(leak_samples, orig_samples)
-    picks = np.linspace(0, len(leak_samples) - 1, min(5, len(leak_samples)), dtype=int)
+    picks = np.linspace(0, len(leak_samples) - 1, min(8, len(leak_samples)), dtype=int)
     hits = []
     for p in picks:
         ls = leak_samples[int(p)]
