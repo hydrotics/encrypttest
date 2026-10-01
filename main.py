@@ -483,17 +483,40 @@ async def send_personalized_reveal(interaction: discord.Interaction) -> None:
         cached, time.perf_counter() - started,
     )
 
+    # Keep the deferred interaction response as a short status message and send the
+    # media as a newly-created ephemeral follow-up. This avoids editing an ephemeral
+    # response into a video attachment, a path that can fail to initialize playback
+    # in some Discord mobile clients. The exact same encoded file is uploaded.
     try:
-        await interaction.edit_original_response(
+        await interaction.followup.send(
             content=content,
-            attachments=[discord.File(path, filename=filename, spoiler=False)],
+            file=discord.File(path, filename=filename, spoiler=False),
+            ephemeral=True,
+            wait=True,
         )
     except Exception:
         log.exception(
             "Failed to deliver reveal attachment reveal=%s user=%s",
             reveal["reveal_id"], interaction.user.id,
         )
-        raise
+        await interaction.edit_original_response(
+            content="❌ I couldn't deliver your personalized reveal. Please try again.",
+            attachments=[],
+        )
+        return
+
+    try:
+        await interaction.edit_original_response(
+            content="✅ Your reveal was sent in the private reply below.",
+            attachments=[],
+        )
+    except discord.HTTPException:
+        # The video has already been delivered; failure to update the status message
+        # should not make the successful upload appear to have failed.
+        log.warning(
+            "Delivered reveal but could not update interaction status reveal=%s user=%s",
+            reveal["reveal_id"], interaction.user.id,
+        )
 
     await asyncio.to_thread(ledger_append, reveal["reveal_id"], interaction.user.id)
 
