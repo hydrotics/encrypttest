@@ -5,6 +5,7 @@ import hmac
 import io
 import itertools
 import logging
+import os
 import re
 import subprocess
 import tempfile
@@ -37,6 +38,14 @@ WINDOW_TOP_FRAMES = 4         # reference frames (ranked by NCC) tried per windo
 WINDOW_READ_TIMEOUT = 60.0
 DEFAULT_TIME_BUDGET = 180.0   # seconds of wall-clock for one video extraction
 ECC_MIN_CC = 0.5
+
+# Image tracing is deliberately memory-bounded. Never retain several full-resolution
+# warped RGB copies at once: a 4K image can turn each copy into hundreds of MB.
+TRACE_IMAGE_MAX_FEATURES = 1400
+TRACE_IMAGE_MAX_CANDIDATES = 2
+TRACE_IMAGE_ECC = True
+TRACE_IMAGE_TRANSLATION_RADIUS = 2
+TRACE_IMAGE_MAX_PIXELS = int(float(os.getenv("TRACE_IMAGE_MAX_MEGAPIXELS", "18")) * 1_000_000)
 
 VIDEO_FPS_HYPOTHESES = (30.0, 27.0, 24.0, 20.0, 18.0, 15.0, 12.0)
 HEIGHT_LADDER = (1080, 900, 720, 648, 576, 540, 480, 360)
@@ -322,7 +331,7 @@ def _warp_candidate(
         src, mat3, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE,
     )
     valid = cv2.warpPerspective(
-        np.ones(leak.shape[:2], np.float32), mat3, (w, h),
+        np.ones(leak.shape[:2], np.uint8), mat3, (w, h),
         flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
     )
     return warped, valid
@@ -406,94 +415,165 @@ def _ecc_refine(
         return warped_rgb, valid
 
 
+def _registration_matrices(
+    orig: np.ndarray,
+    leak: np.ndarray,
+    *,
+    max_candidates: int = TRACE_IMAGE_MAX_CANDIDATES,
+) -> list[np.ndarray]:
+    """Return a tiny set of promising leak->original registration matrices.
+
+    The old implementation immediately warped the entire leak into full
+    resolution for every SIFT/ORB hypothesis and retained those arrays in a
+    list. On large images that made peak RSS grow roughly with the number of
+    registration candidates. This function keeps only compact 3x3 matrices;
+    full-resolution warps are created one at a time by ``extract_image``.
+    """
+    o_g, o_sc = _feature_image(orig)
+    l_g, l_sc = _feature_image(leak)
+    o_shape = orig.shape[:2]
+    l_shape = leak.shape[:2]
+    found: list[tuple[int, np.ndarray]] = []
+
+    def to_full(hmat: np.ndarray) -> np.ndarray:
+        return (
+            np.diag([1.0 / max(o_sc, 1e-8), 1.0 / max(o_sc, 1e-8), 1.0])
+            @ hmat
+            @ np.diag([max(l_sc, 1e-8), max(l_sc, 1e-8), 1.0])
+        ).astype(np.float64)
+
+    def add_mat(mat3: np.ndarray, inliers: int) -> None:
+        if len(found) >= max(1, int(max_candidates)):
+            return
+        full = mat3 if mat3.shape == (3, 3) else np.asarray(mat3, np.float64)
+        if not _homography_is_reasonable(full, l_shape, o_shape):
+            return
+        found.append((int(inliers), full))
+
+    try:
+        sift = cv2.SIFT_create(
+            nfeatures=TRACE_IMAGE_MAX_FEATURES,
+            contrastThreshold=0.02,
+            edgeThreshold=10,
+        )
+        okp, od = sift.detectAndCompute(o_g, None)
+        lkp, ld = sift.detectAndCompute(l_g, None)
+        if od is not None and ld is not None and len(okp) >= 8 and len(lkp) >= 8:
+            matches = cv2.BFMatcher(cv2.NORM_L2).knnMatch(ld, od, k=2)
+            good = [
+                m[0] for m in matches
+                if len(m) == 2 and m[0].distance < 0.80 * m[1].distance
+            ]
+            if len(good) >= 6:
+                src = np.float32([lkp[m.queryIdx].pt for m in good])
+                dst = np.float32([okp[m.trainIdx].pt for m in good])
+
+                # Prefer a homography for crop/rotation/perspective edits.
+                try:
+                    hmat, mask = cv2.findHomography(
+                        src, dst, cv2.RANSAC, 3.0, maxIters=2500, confidence=0.99,
+                    )
+                    if hmat is not None and mask is not None:
+                        inliers = int(mask.sum())
+                        if inliers >= 6:
+                            add_mat(to_full(hmat), inliers)
+                except cv2.error:
+                    pass
+
+                # Partial affine is useful for ordinary crop/resize/rotation and
+                # is kept as a fallback when the homography is weak.
+                if len(found) < max(1, int(max_candidates)):
+                    try:
+                        mat = _estimate_affine(
+                            src / max(l_sc, 1e-8),
+                            dst / max(o_sc, 1e-8),
+                            True,
+                        )
+                        if mat is not None:
+                            # The affine returned above lives in reduced-feature
+                            # coordinates, so map it back to full image pixels.
+                            full = to_full(mat)
+                            if _homography_is_reasonable(full, l_shape, o_shape):
+                                add_mat(full, len(good))
+                    except cv2.error:
+                        pass
+    except cv2.error as exc:
+        log.debug("SIFT registration failed: %s", exc)
+
+    if not found:
+        try:
+            orb = cv2.ORB_create(nfeatures=1200, fastThreshold=8)
+            okp, od = orb.detectAndCompute(o_g, None)
+            lkp, ld = orb.detectAndCompute(l_g, None)
+            if od is not None and ld is not None and len(okp) >= 8 and len(lkp) >= 8:
+                matches = cv2.BFMatcher(cv2.NORM_HAMMING).knnMatch(ld, od, k=2)
+                good = [
+                    m[0] for m in matches
+                    if len(m) == 2 and m[0].distance < 0.78 * m[1].distance
+                ]
+                if len(good) >= 8:
+                    src = np.float32([lkp[m.queryIdx].pt for m in good])
+                    dst = np.float32([okp[m.trainIdx].pt for m in good])
+                    hmat, mask = cv2.findHomography(
+                        src, dst, cv2.RANSAC, 4.0, maxIters=1800,
+                    )
+                    if hmat is not None and mask is not None:
+                        inliers = int(mask.sum())
+                        if inliers >= 6:
+                            add_mat(to_full(hmat), inliers)
+        except cv2.error as exc:
+            log.debug("ORB registration failed: %s", exc)
+
+    found.sort(key=lambda item: item[0], reverse=True)
+    return [mat for _, mat in found[: max(1, int(max_candidates))]]
+
+
 def _registration_candidates(
     orig: np.ndarray,
     leak: np.ndarray,
     *,
     refine_ecc: bool = True,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
-    o_g, o_sc = _feature_image(orig)
-    l_g, l_sc = _feature_image(leak)
+    """Compatibility wrapper; large callers should prefer _registration_matrices."""
     o_shape = orig.shape[:2]
-
     candidates: list[tuple[np.ndarray, np.ndarray]] = [
         (leak, np.ones(leak.shape[:2], np.float32))
     ]
-
-    def to_full(hmat: np.ndarray) -> np.ndarray:
-        return (
-            np.diag([1.0 / o_sc, 1.0 / o_sc, 1.0])
-            @ hmat
-            @ np.diag([l_sc, l_sc, 1.0])
-        )
-
-    def add_mat(mat3: np.ndarray, refine: bool) -> None:
-        if not _homography_is_reasonable(mat3, leak.shape[:2], o_shape):
-            return
+    for mat3 in _registration_matrices(orig, leak):
         warped, valid = _warp_candidate(leak, mat3, o_shape)
         candidates.append((warped, valid))
-        if refine and refine_ecc:
+        if refine_ecc:
             refined, refined_valid = _ecc_refine(orig, warped, valid)
             if refined is not warped:
                 candidates.append((refined, refined_valid))
+        if len(candidates) >= TRACE_IMAGE_MAX_CANDIDATES + 1:
+            break
 
-    try:
-        sift = cv2.SIFT_create(nfeatures=2500, contrastThreshold=0.015, edgeThreshold=10)
-        okp, od = sift.detectAndCompute(o_g, None)
-        lkp, ld = sift.detectAndCompute(l_g, None)
-
-        if od is not None and ld is not None and len(okp) >= 8 and len(lkp) >= 8:
-            matches = cv2.BFMatcher(cv2.NORM_L2).knnMatch(ld, od, k=2)
-            good = [m[0] for m in matches if len(m) == 2 and m[0].distance < 0.8 * m[1].distance]
-            log.debug("SIFT: %d leak kp, %d orig kp, %d good matches", len(lkp), len(okp), len(good))
-
-            if len(good) >= 6:
-                src = np.float32([lkp[m.queryIdx].pt for m in good])
-                dst = np.float32([okp[m.trainIdx].pt for m in good])
-
-                for partial in (False, True):
-                    try:
-                        mat = _estimate_affine(src / max(l_sc, 1e-8), dst / max(o_sc, 1e-8), partial)
-                        if mat is not None:
-                            add_mat(mat, True)
-                    except cv2.error:
-                        pass
-
-                hmat, mask = cv2.findHomography(src, dst, cv2.RANSAC, 3.0, maxIters=4000, confidence=0.995)
-                if hmat is not None and mask is not None and int(mask.sum()) >= 6:
-                    add_mat(to_full(hmat), True)
-    except cv2.error as exc:
-        log.debug("SIFT registration failed: %s", exc)
-
-    if len(candidates) < 3:
-        try:
-            orb = cv2.ORB_create(nfeatures=2500, fastThreshold=5)
-            okp, od = orb.detectAndCompute(o_g, None)
-            lkp, ld = orb.detectAndCompute(l_g, None)
-            if od is not None and ld is not None and len(okp) >= 8 and len(lkp) >= 8:
-                matches = cv2.BFMatcher(cv2.NORM_HAMMING).knnMatch(ld, od, k=2)
-                good = [m[0] for m in matches if len(m) == 2 and m[0].distance < 0.78 * m[1].distance]
-                if len(good) >= 8:
-                    src = np.float32([lkp[m.queryIdx].pt for m in good])
-                    dst = np.float32([okp[m.trainIdx].pt for m in good])
-                    hmat, mask = cv2.findHomography(src, dst, cv2.RANSAC, 4.0, maxIters=3000)
-                    if hmat is not None and mask is not None and int(mask.sum()) >= 6:
-                        add_mat(to_full(hmat), False)
-        except cv2.error as exc:
-            log.debug("ORB registration failed: %s", exc)
-
-    if orig.shape[:2] != leak.shape[:2]:
+    if orig.shape[:2] != leak.shape[:2] and len(candidates) < TRACE_IMAGE_MAX_CANDIDATES + 1:
         resized = cv2.resize(leak, (orig.shape[1], orig.shape[0]), interpolation=cv2.INTER_AREA)
         candidates.append((resized, np.ones(orig.shape[:2], np.float32)))
 
     cleaned = []
-    for cand, valid in candidates:
+    for cand, valid in candidates[: TRACE_IMAGE_MAX_CANDIDATES + 1]:
         if valid is not None and np.any(valid < 0.99):
             valid = cv2.GaussianBlur(valid.astype(np.float32), (0, 0), 0.8)
             valid[valid < 0.12] = 0.0
         cleaned.append((cand, valid))
     return cleaned
 
+def _image_trace_variants(h: int, w: int) -> list[tuple[float, float, float, float, float]]:
+    """Small residual-registration search used after feature registration.
+
+    SIFT/ORB already recover crop/scale/rotation. Re-searching every scale and
+    rotation at full resolution is expensive, so the image trace path only
+    checks a 3x3 translation neighborhood for residual alignment.
+    """
+    radius = max(1, int(TRACE_IMAGE_TRANSLATION_RADIUS))
+    return [
+        (0.0, 0.0, 0.0, dx / max(w, 1), dy / max(h, 1))
+        for dy in (-radius, 0, radius)
+        for dx in (-radius, 0, radius)
+    ]
 
 def _geometry_variants(
     h: int,
@@ -753,52 +833,90 @@ def render_image_preview(
     )
 
 
+def _load_luma(path: Path) -> np.ndarray:
+    """Load one image as compact uint8 luma with an explicit trace-size guard."""
+    with Image.open(path) as im:
+        size = tuple(ImageOps.exif_transpose(im).size)
+        pixels = int(size[0]) * int(size[1])
+        if pixels > TRACE_IMAGE_MAX_PIXELS:
+            raise RuntimeError(
+                f"Image is too large for low-memory tracing ({pixels / 1e6:.1f} MP; "
+                f"limit {TRACE_IMAGE_MAX_PIXELS / 1e6:.1f} MP)."
+            )
+        # PIL's 8-bit luminance is close to the watermark's Y channel and uses
+        # one byte per pixel, avoiding the 4x memory cost of float32 luma.
+        gray = ImageOps.exif_transpose(im).convert("L")
+        return np.array(gray, dtype=np.uint8, copy=True)
+
+
 def extract_image(
     orig: Path,
     leak: Path,
     key: bytes,
     reveal_id: str,
     cell: int = CELL,
+    time_budget: float = 30.0,
 ) -> dict:
-    del cell
+    """Trace an edited/cropped image with bounded peak memory.
 
-    o = np.asarray(_load_rgb(orig), np.uint8)
-    l = np.asarray(_load_rgb(leak), np.uint8)
-    oy = o @ RGB2Y
+    Only luma is retained at full resolution and only one registered warp is
+    materialized at a time. Registration itself is performed on reduced feature
+    images, so text/icons/grey overlays do not cause several full-size buffers
+    to accumulate.
+    """
+    del cell
+    deadline = time.monotonic() + max(1.0, float(time_budget))
+    oy = _load_luma(orig)
+    leak_y = _load_luma(leak)
     h, w = oy.shape
 
-    candidates = _registration_candidates(o, l)
-    log.info("image extract: %d registration candidates", len(candidates))
+    # Identity/resized path is always tested. It is the cheapest case and can
+    # decode immediately when the leak was only recompressed or tone-shifted.
+    base_candidates: list[tuple[np.ndarray, np.ndarray]] = []
+    if leak_y.shape == oy.shape:
+        base_candidates.append((leak_y, np.ones(leak_y.shape, np.uint8)))
+    else:
+        resized = cv2.resize(leak_y, (w, h), interpolation=cv2.INTER_AREA)
+        base_candidates.append((resized, np.ones(oy.shape, np.uint8)))
 
-    prepared: list[tuple[np.ndarray, np.ndarray]] = []
-    for candidate, valid in candidates:
-        if candidate.shape[:2] != oy.shape:
-            candidate = cv2.resize(candidate, (w, h), interpolation=cv2.INTER_AREA)
-            valid = cv2.resize(valid.astype(np.float32), (w, h), interpolation=cv2.INTER_AREA)
-        prepared.append((candidate.astype(np.float32) @ RGB2Y, valid))
+    if time.monotonic() > deadline:
+        return {"user_id": 0, "metric": 0.0, "ok": False, "valid": False}
+    matrices = _registration_matrices(oy, leak_y)
+    log.info("image extract: %d compact registration matrices", len(matrices))
 
-    # Stage 1: rank candidates cheaply at identity so the expensive geometry search
-    # only runs on the best-aligned ones.
-    zero = [(0.0, 0.0, 0.0, 0.0, 0.0)]
-    ranked = sorted(
-        prepared,
-        key=lambda p: -_top_scores(oy, p[0], key, reveal_id, 0, zero, p[1], keep=1)[0][0],
-    )
+    # Decode the cheap identity/resized candidate first.
+    variants = _image_trace_variants(h, w)
+    for cand_y, valid in base_candidates:
+        if time.monotonic() > deadline:
+            return {"user_id": 0, "metric": 0.0, "ok": False, "valid": False}
+        uid, metric, ok = _decode_registered(
+            oy, cand_y, key, reveal_id, 0, variants, valid=valid,
+        )
+        if ok:
+            return {"user_id": int(uid), "metric": float(metric), "ok": True, "valid": True}
 
-    # Stage 2: full translation/scale/rotation search on the top candidates.
-    variants = _geometry_variants(h, w)
-    best = None
-    for cand_y, valid in ranked[:5]:
-        uid, metric, ok = _decode_registered(oy, cand_y, key, reveal_id, 0, variants, valid=valid)
-        if ok and (best is None or metric > best["metric"]):
-            best = {"user_id": int(uid), "metric": float(metric), "ok": True}
+    # Registered candidates are materialized, tested, and released one at a time.
+    for mat3 in matrices:
+        if time.monotonic() > deadline:
             break
+        warped, valid = _warp_candidate(leak_y, mat3, (h, w))
+        if TRACE_IMAGE_ECC:
+            warped, valid = _ecc_refine(oy, warped, valid)
+        if valid is not None and np.any(valid < 0.99):
+            valid = cv2.GaussianBlur(valid.astype(np.float32), (0, 0), 0.8)
+            valid[valid < 0.12] = 0.0
 
-    if best:
-        return best
-    log.info("image extract: no candidate decoded (candidates=%d)", len(prepared))
-    return {"user_id": 0, "metric": 0.0, "ok": False}
+        if time.monotonic() > deadline:
+            del warped, valid
+            break
+        uid, metric, ok = _decode_registered(
+            oy, warped, key, reveal_id, 0, variants, valid=valid,
+        )
+        if ok:
+            return {"user_id": int(uid), "metric": float(metric), "ok": True, "valid": True}
+        del warped, valid
 
+    return {"user_id": 0, "metric": 0.0, "ok": False, "valid": False}
 
 def render_image_delivery(
     src: Path,
@@ -1960,7 +2078,9 @@ def extract(
         heights = [max_height]
 
     if kind == "image":
-        res = extract_image(orig, leak, key, reveal_id, image_cell)
+        res = extract_image(
+            orig, leak, key, reveal_id, image_cell, time_budget=time_budget
+        )
     elif kind == "video_frame":
         res = extract_video_frame(
             orig,
