@@ -1069,7 +1069,7 @@ def _adaptive_video_shape(
     fps_candidates = [source_fps]
     for f in (30.0, 27.0, 24.0, 20.0, 18.0, 15.0, 12.0):
         f = min(source_fps, f)
-        if f >= 12.0:
+        if f >= 1.0:
             fps_candidates.append(round(f, 3))
     fps_candidates = sorted(set(fps_candidates), reverse=True)
 
@@ -1298,7 +1298,7 @@ def embed_video(
         fps_candidates = []
         for f in (base_fps, 27.0, 24.0, 20.0, 18.0, 15.0):
             f = min(base_fps, f)
-            if f >= 12.0:
+            if f >= 1.0:
                 fps_candidates.append(round(float(f), 3))
         fps_candidates = list(dict.fromkeys(fps_candidates))
 
@@ -1371,144 +1371,8 @@ def embed_video(
     )
     raise RuntimeError(
         "Video could not be encoded below the delivery limit "
-        f"({profile_text}, target {target / 1048576:.1f} MiB)."
+        f"({profile_text}, target {target / 1048576:.1f} MiB)." if target else f"({profile_text})."
     )
-
-def _trace_heights(orig: Path, leak_shape: tuple[int, int], max_height: int) -> list[int]:
-    source_w, source_h, _, _ = _probe_video(orig, max_height)
-    limit = min(source_h, int(max_height))
-    leak_h = max(144, int(leak_shape[0]))
-    common = [1080, 900, 768, 720, 648, 576, 540, 480, 360]
-    values = [min(leak_h, limit)]
-    values.extend(v for v in common if v <= limit)
-    values = sorted(set(max(144, int(v)) for v in values), key=lambda v: abs(v - leak_h))
-    return values
-
-def _seek_frame(
-    src: Path,
-    time_s: float,
-    max_height: int,
-) -> tuple[np.ndarray, float, float, int, int]:
-    w, h, fps, _ = _probe_video(src, max_height)
-    t = max(0.0, float(time_s))
-    vf = _scale_filter(h, "lanczos")
-    cmd = [
-        get_ffmpeg(),
-        "-hide_banner",
-        "-loglevel", "error",
-        "-ss", f"{t:.4f}",
-        "-i", str(src),
-        "-an",
-        "-vf", vf,
-        "-frames:v", "1",
-        "-f", "rawvideo",
-        "-pix_fmt", "rgb24",
-        "-",
-    ]
-    proc = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=20,
-    )
-    expected = w * h * 3
-    if len(proc.stdout) < expected:
-        detail = proc.stderr.decode("utf-8", "replace")[-1000:]
-        raise RuntimeError(f"FFmpeg could not seek video frame. {detail}".strip())
-    frame = np.frombuffer(proc.stdout[:expected], np.uint8).reshape(h, w, 3).copy()
-    return frame, fps, t, w, h
-
-
-
-def _coarse_hits(
-    orig: Path,
-    leak_rgb: np.ndarray,
-    max_height: int,
-    max_seconds: int = 300,
-    top_k: int = TRACE_FRAME_HINTS,
-) -> list[float]:
-    coarse_height = max(144, min(int(max_height), 360))
-    source_w, source_h, source_fps, _ = _probe_video(orig, coarse_height)
-    coarse_fps = min(float(TRACE_COARSE_FPS), max(float(source_fps), 1.0))
-    vf = f"fps={coarse_fps:.6f}," + _scale_filter(coarse_height, "fast_bilinear")
-    leak_gray = cv2.cvtColor(leak_rgb, cv2.COLOR_RGB2GRAY)
-    leak_sig = _visual_signature(leak_gray)
-    _, leak_desc = _sift_descriptors(leak_gray)
-    ranked: list[tuple[float, float]] = []
-    for idx, buf in _iter_frames(orig, vf, source_w, source_h, max_seconds=max_seconds):
-        gray = np.frombuffer(buf, np.uint8, count=source_w * source_h).reshape(source_h, source_w)
-        diff = float(np.mean(np.abs(_visual_signature(gray) - leak_sig)))
-        sift_score = 0.0
-        if leak_desc is not None and idx % 2 == 0:
-            _, frame_desc = _sift_descriptors(gray)
-            sift_score = _sift_match_count(leak_desc, frame_desc)
-        rank = diff - min(sift_score, 30.0) * 0.004
-        ranked.append((rank, idx / max(coarse_fps, 1e-6)))
-        if len(ranked) > top_k * 6:
-            ranked.sort(key=lambda x: x[0])
-            del ranked[top_k * 4:]
-    ranked.sort(key=lambda x: x[0])
-    times: list[float] = []
-    for _, time_s in ranked:
-        if all(abs(time_s - old) > 0.30 for old in times):
-            times.append(float(time_s))
-        if len(times) >= top_k:
-            break
-    return times
-
-def _registration_decode(
-    orig_rgb: np.ndarray,
-    leak_rgb: np.ndarray,
-    key: bytes,
-    reveal_id: str,
-    groups: list[int],
-) -> Optional[tuple[int, float]]:
-    oy = cv2.cvtColor(orig_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
-    direct = leak_rgb
-    if direct.shape[:2] != orig_rgb.shape[:2]:
-        direct = cv2.resize(
-            direct,
-            (orig_rgb.shape[1], orig_rgb.shape[0]),
-            interpolation=cv2.INTER_LANCZOS4,
-        )
-    variants = [
-        (0.0, 0.0, 0.0, 0.0, 0.0),
-        (-0.004, -0.004, 0.0, 0.0, 0.0),
-        (0.004, 0.004, 0.0, 0.0, 0.0),
-    ]
-    direct_y = cv2.cvtColor(direct, cv2.COLOR_RGB2GRAY).astype(np.float32)
-    for group in groups:
-        uid, metric, ok = _decode_registered(
-            oy, direct_y, key, reveal_id, group, variants
-        )
-        if ok:
-            return int(uid), float(metric)
-    candidates = _registration_candidates(
-        orig_rgb,
-        leak_rgb,
-        refine_ecc=True,
-    )
-    for candidate, valid in candidates:
-        if candidate.shape[:2] != orig_rgb.shape[:2]:
-            candidate = cv2.resize(
-                candidate,
-                (orig_rgb.shape[1], orig_rgb.shape[0]),
-                interpolation=cv2.INTER_LANCZOS4,
-            )
-            valid = cv2.resize(
-                valid.astype(np.float32),
-                (orig_rgb.shape[1], orig_rgb.shape[0]),
-                interpolation=cv2.INTER_LINEAR,
-            )
-        leak_y = cv2.cvtColor(candidate, cv2.COLOR_RGB2GRAY).astype(np.float32)
-        for group in groups:
-            uid, metric, ok = _decode_registered(
-                oy, leak_y, key, reveal_id, group, variants, valid=valid
-            )
-            if ok:
-                return int(uid), float(metric)
-    return None
-
 
 def _visual_signature(gray: np.ndarray, width: int = 48, height: int = 27) -> np.ndarray:
     small = cv2.resize(gray, (width, height), interpolation=cv2.INTER_AREA).astype(np.float32)
@@ -1521,11 +1385,7 @@ def _visual_signature(gray: np.ndarray, width: int = 48, height: int = 27) -> np
 
 def _sift_descriptors(gray: np.ndarray):
     small, _ = _feature_image(gray, COARSE_H)
-    sift = cv2.SIFT_create(
-        nfeatures=300,
-        contrastThreshold=0.04,
-        edgeThreshold=10,
-    )
+    sift = cv2.SIFT_create(nfeatures=300, contrastThreshold=0.04, edgeThreshold=10)
     return sift.detectAndCompute(small, None)
 
 
@@ -1539,34 +1399,76 @@ def _sift_match_count(query_desc: np.ndarray | None, frame_desc: np.ndarray | No
     return float(sum(1 for m in matches if len(m) == 2 and m[0].distance < 0.78 * m[1].distance))
 
 
-def _group_hypotheses(
-    source_frame_idx: int,
-    source_fps: float,
-    delivery_fps: float | None = None,
-) -> list[int]:
-    source_fps = max(1.0, float(source_fps))
-    source_frame_idx = max(0, int(source_frame_idx))
-    values: list[int] = []
-    seen: set[int] = set()
-    def add(value: int) -> None:
-        value = max(0, int(value))
-        for item in (value, value - 1, value + 1):
-            if item >= 0 and item not in seen:
-                seen.add(item)
-                values.append(item)
-    add(source_frame_idx // VIDEO_GROUP)
-    rates = [float(delivery_fps)] if delivery_fps else [source_fps, *VIDEO_FPS_HYPOTHESES]
-    for rate in rates:
-        rate = max(1.0, float(rate))
-        if rate > source_fps + 0.5:
-            continue
-        delivered_idx = int(round(source_frame_idx * rate / source_fps))
-        add(delivered_idx // VIDEO_GROUP)
-    return values
+def _trace_height(orig: Path, leak_shape: tuple[int, int], max_height: int) -> int:
+    _, source_h, _, _ = _probe_video(orig, max_height)
+    leak_h = int(leak_shape[0]) if leak_shape and leak_shape[0] else source_h
+    return max(144, min(source_h, int(max_height), leak_h))
 
 
+def _seek_frame(src: Path, time_s: float, max_height: int) -> tuple[np.ndarray, float, float, int, int]:
+    w, h, fps, _ = _probe_video(src, max_height)
+    duration = _video_duration_seconds(src)
+    t = min(max(0.0, float(time_s)), max(0.0, duration - 1e-3))
+    vf = _scale_filter(h, "lanczos")
+    cmd = [
+        get_ffmpeg(), "-hide_banner", "-loglevel", "error", "-ss", f"{t:.3f}",
+        "-i", str(src), "-an", "-vf", vf, "-frames:v", "1", "-f", "rawvideo",
+        "-pix_fmt", "rgb24", "-",
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=12)
+    expected = w * h * 3
+    if proc.returncode != 0 or len(proc.stdout) < expected:
+        raise RuntimeError(proc.stderr.decode("utf-8", "replace")[-1000:])
+    frame = np.frombuffer(proc.stdout[:expected], np.uint8).reshape(h, w, 3).copy()
+    return frame, fps, t, w, h
 
-def _direct_decode(
+
+def _coarse_hits(
+    orig: Path,
+    leak_rgb: np.ndarray,
+    max_height: int,
+    max_seconds: int = 300,
+    top_k: int = 5,
+) -> list[float]:
+    coarse_h = max(144, min(360, int(max_height)))
+    w, h, source_fps, _ = _probe_video(orig, coarse_h)
+    coarse_fps = min(1.5, max(1.0, float(source_fps)))
+    vf = f"fps={coarse_fps:.6f}," + _scale_filter(coarse_h, "fast_bilinear")
+    leak_gray = cv2.cvtColor(leak_rgb, cv2.COLOR_RGB2GRAY)
+    leak_sig = _visual_signature(leak_gray)
+    visual: list[tuple[float, int]] = []
+    for idx, buf in _iter_frames(orig, vf, w, h, max_seconds=max_seconds):
+        gray = np.frombuffer(buf, np.uint8, count=w * h).reshape(h, w)
+        diff = float(np.mean(np.abs(_visual_signature(gray) - leak_sig)))
+        visual.append((diff, idx))
+    visual.sort(key=lambda x: x[0])
+    shortlist = visual[:max(12, top_k * 4)]
+    _, leak_desc = _sift_descriptors(leak_gray)
+    ranked: list[tuple[float, int]] = []
+    for diff, idx in shortlist:
+        sift = 0.0
+        if leak_desc is not None:
+            target_idx = int(idx)
+            found = None
+            for j, buf in _iter_frames(orig, vf, w, h, skip=target_idx, limit=1):
+                if j == target_idx:
+                    found = np.frombuffer(buf, np.uint8, count=w * h).reshape(h, w)
+                    break
+            if found is not None:
+                _, desc = _sift_descriptors(found)
+                sift = _sift_match_count(leak_desc, desc)
+        ranked.append((diff - min(sift, 40.0) * 0.006, idx))
+    ranked.sort(key=lambda x: x[0])
+    out: list[float] = []
+    for _, idx in ranked:
+        t = idx / coarse_fps
+        if all(abs(t - old) >= 0.75 for old in out):
+            out.append(float(t))
+        if len(out) >= top_k:
+            break
+    return out
+
+def _registration_decode(
     orig_rgb: np.ndarray,
     leak_rgb: np.ndarray,
     key: bytes,
@@ -1574,200 +1476,123 @@ def _direct_decode(
     groups: list[int],
 ) -> Optional[tuple[int, float]]:
     oy = cv2.cvtColor(orig_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
-    leak = leak_rgb
-    if leak.shape[:2] != orig_rgb.shape[:2]:
-        leak = cv2.resize(
-            leak,
-            (orig_rgb.shape[1], orig_rgb.shape[0]),
-            interpolation=cv2.INTER_LANCZOS4,
-        )
-    leak_y = cv2.cvtColor(leak, cv2.COLOR_RGB2GRAY).astype(np.float32)
-    variants = [(0.0, 0.0, 0.0, 0.0, 0.0)]
+    variants = [(0.0, 0.0, 0.0, 0.0, 0.0), (-0.004, -0.004, 0.0, 0.0, 0.0), (0.004, 0.004, 0.0, 0.0, 0.0)]
+    direct = leak_rgb if leak_rgb.shape[:2] == orig_rgb.shape[:2] else cv2.resize(leak_rgb, (orig_rgb.shape[1], orig_rgb.shape[0]), interpolation=cv2.INTER_LANCZOS4)
+    direct_y = cv2.cvtColor(direct, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    best = None
     for group in groups:
-        uid, metric, ok = _decode_registered(
-            oy, leak_y, key, reveal_id, group, variants
-        )
-        if ok:
-            return int(uid), float(metric)
-    return None
+        uid, metric, ok = _decode_registered(oy, direct_y, key, reveal_id, group, variants)
+        if ok and (best is None or metric > best[1]):
+            best = (int(uid), float(metric))
+    try:
+        candidates = _registration_candidates(orig_rgb, leak_rgb, refine_ecc=False)
+    except (cv2.error, ValueError, np.linalg.LinAlgError):
+        return best
+    for candidate, valid in candidates:
+        if candidate.shape[:2] != orig_rgb.shape[:2]:
+            candidate = cv2.resize(candidate, (orig_rgb.shape[1], orig_rgb.shape[0]), interpolation=cv2.INTER_LANCZOS4)
+            valid = cv2.resize(valid.astype(np.float32), (orig_rgb.shape[1], orig_rgb.shape[0]), interpolation=cv2.INTER_LINEAR)
+        leak_y = cv2.cvtColor(candidate, cv2.COLOR_RGB2GRAY).astype(np.float32)
+        for group in groups:
+            uid, metric, ok = _decode_registered(oy, leak_y, key, reveal_id, group, variants, valid=valid)
+            if ok and (best is None or metric > best[1]):
+                best = (int(uid), float(metric))
+    return best
 
 
-def _exact_video_frame(
-    orig: Path,
-    leak_rgb: np.ndarray,
-    time_s: float,
-    key: bytes,
-    reveal_id: str,
-    max_height: int,
-) -> Optional[tuple[int, float, int, float]]:
-    offsets = TRACE_FRAME_OFFSETS_SEC
-    heights = _trace_heights(orig, leak_rgb.shape[:2], max_height)
-    fallback: list[tuple[np.ndarray, float, float, int, int, list[int]]] = []
-    for height in heights:
-        for offset in offsets:
-            candidate_time = max(0.0, float(time_s) + float(offset))
-            try:
-                frame, source_fps, actual_time, _, _ = _seek_frame(
-                    orig, candidate_time, height
-                )
-            except (OSError, RuntimeError, subprocess.TimeoutExpired):
-                continue
-            source_idx = int(round(actual_time * source_fps))
-            groups = _group_hypotheses(source_idx, source_fps)
-            direct = _direct_decode(
-                frame, leak_rgb, key, reveal_id, groups
-            )
-            if direct is not None:
-                uid, metric = direct
-                return int(uid), float(metric), source_idx, actual_time
-            fallback.append((frame, source_fps, actual_time, source_idx, height, groups))
-    for frame, source_fps, actual_time, source_idx, height, groups in fallback[:2]:
+def _direct_decode(orig_rgb: np.ndarray, leak_rgb: np.ndarray, key: bytes, reveal_id: str, groups: list[int]) -> Optional[tuple[int, float]]:
+    oy = cv2.cvtColor(orig_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    leak = leak_rgb if leak_rgb.shape[:2] == orig_rgb.shape[:2] else cv2.resize(leak_rgb, (orig_rgb.shape[1], orig_rgb.shape[0]), interpolation=cv2.INTER_LANCZOS4)
+    leak_y = cv2.cvtColor(leak, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    variant = [(0.0, 0.0, 0.0, 0.0, 0.0)]
+    best = None
+    for group in groups:
+        uid, metric, ok = _decode_registered(oy, leak_y, key, reveal_id, group, variant)
+        if ok and (best is None or metric > best[1]):
+            best = (int(uid), float(metric))
+    return best
+
+
+def _exact_video_frame(orig: Path, leak_rgb: np.ndarray, time_s: float, key: bytes, reveal_id: str, max_height: int, leak_fps: float | None = None) -> Optional[tuple[int, float, int, float]]:
+    height = _trace_height(orig, leak_rgb.shape[:2], max_height)
+    candidates: list[tuple[np.ndarray, float, int, float]] = []
+    for offset in (0.0, -0.20, 0.20, -0.50, 0.50):
         try:
-            hit = _registration_decode(
-                frame, leak_rgb, key, reveal_id, groups
-            )
+            frame, fps, actual, _, _ = _seek_frame(orig, max(0.0, float(time_s) + offset), height)
+        except (OSError, RuntimeError, subprocess.TimeoutExpired):
+            continue
+        idx = int(round(actual * fps))
+        candidates.append((frame, fps, idx, actual))
+    for frame, fps, idx, actual in candidates:
+        hit = _direct_decode(frame, leak_rgb, key, reveal_id, _group_hypotheses(idx, fps, leak_fps))
+        if hit is not None:
+            uid, metric = hit
+            return uid, metric, idx, actual
+    for frame, fps, idx, actual in candidates[:3]:
+        try:
+            hit = _registration_decode(frame, leak_rgb, key, reveal_id, _group_hypotheses(idx, fps, leak_fps))
         except (cv2.error, ValueError, np.linalg.LinAlgError):
             continue
         if hit is not None:
             uid, metric = hit
-            return int(uid), float(metric), source_idx, actual_time
+            return uid, metric, idx, actual
     return None
 
-def extract_video_frame(
-    orig: Path,
-    leak: Path,
-    key: bytes,
-    reveal_id: str,
-    *,
-    cell: int = CELL,
-    max_height: int = 1080,
-    start_frame: int = 0,
-) -> dict:
+
+def extract_video_frame(orig: Path, leak: Path, key: bytes, reveal_id: str, *, cell: int = CELL, max_height: int = 1080, start_frame: int = 0) -> dict:
     del cell
     leak_rgb = np.asarray(_load_rgb(leak), np.uint8)
-    leak_gray = cv2.cvtColor(leak_rgb, cv2.COLOR_RGB2GRAY)
     source_fps = _probe_video(orig, max_height)[2]
-    if start_frame > 0:
-        times = [float(start_frame) / max(source_fps, 1.0)]
-    else:
-        times = _coarse_hits(orig, leak_rgb, max_height)
+    times = [float(start_frame) / max(source_fps, 1.0)] if start_frame > 0 else _coarse_hits(orig, leak_rgb, max_height)
     if not times:
         times = [0.0]
-    for time_s in times[:TRACE_FRAME_HINTS]:
-        hit = _exact_video_frame(
-            orig,
-            leak_rgb,
-            time_s,
-            key,
-            reveal_id,
-            max_height,
-        )
-        if hit is None:
-            continue
-        uid, metric, frame, actual_time = hit
-        return {
-            "user_id": int(uid),
-            "metric": float(metric),
-            "frame": int(frame),
-            "time": float(actual_time),
-            "ok": True,
-            "valid": True,
-        }
+    for time_s in times:
+        hit = _exact_video_frame(orig, leak_rgb, time_s, key, reveal_id, max_height)
+        if hit is not None:
+            uid, metric, frame, actual = hit
+            return {"user_id": int(uid), "metric": float(metric), "frame": int(frame), "time": float(actual), "ok": True, "valid": True}
     return _fail(frame=0, time=0.0)
 
 
-def _sample_leak_video(
-    leak: Path,
-    max_height: int,
-    count: int = 6,
-) -> tuple[list[tuple[int, np.ndarray]], float]:
+def _sample_leak_video(leak: Path, max_height: int, count: int = 5) -> tuple[list[tuple[int, np.ndarray]], float]:
     w, h, fps, vf = _probe_video(leak, max_height)
-    total = max(1, int(round(_video_duration_seconds(leak) * fps)))
-    count = max(1, min(int(count), TRACE_MAX_SAMPLES))
-    step = max(1, total // count)
-    wanted = sorted({min(total - 1, i * step + step // 2) for i in range(count)})
+    duration = _video_duration_seconds(leak)
+    count = max(1, min(int(count), 8))
+    if duration <= 0:
+        times = [0.0]
+    else:
+        times = [duration * (i + 0.5) / count for i in range(count)]
+    wanted = set(int(round(t * fps)) for t in times)
     out: list[tuple[int, np.ndarray]] = []
-    for idx, buf in _iter_frames(leak, vf, w, h):
+    max_seconds = max(1, int(np.ceil(duration))) if duration > 0 else 1
+    for idx, buf in _iter_frames(leak, vf, w, h, max_seconds=max_seconds):
         if idx in wanted:
-            frame = np.frombuffer(buf, np.uint8, count=w * h).reshape(h, w).copy()
-            out.append((idx, frame))
-        if idx >= wanted[-1]:
-            break
+            out.append((idx, np.frombuffer(buf, np.uint8, count=w * h).reshape(h, w).copy()))
+            if len(out) >= len(wanted):
+                break
     return out, fps
 
 
-def _match_and_decode(
-    orig: Path,
-    samples: list[tuple[int, np.ndarray]],
-    leak_fps: float,
-    key: bytes,
-    reveal_id: str,
-    max_height: int,
-    max_seconds: int = 300,
-) -> Optional[tuple]:
-    if not samples:
-        return None
-    w, h, source_fps, vf = _probe_video(orig, max_height)
-    refs = [_visual_signature(frame) for _, frame in samples]
-    best: list[Optional[tuple]] = [None] * len(samples)
-    for idx, buf in _iter_frames(orig, vf, w, h, max_seconds=max_seconds):
-        fr = np.frombuffer(buf, np.uint8, count=w * h).reshape(h, w)
-        sig = _visual_signature(fr)
-        for k, ref in enumerate(refs):
-            diff = float(np.mean(np.abs(sig - ref)))
-            if best[k] is None or diff < best[k][0]:
-                best[k] = (diff, idx, fr.copy())
-    for k, hit in enumerate(best):
-        if hit is None:
-            continue
-        _, source_idx, fr = hit
-        leak_idx, leak_frame = samples[k]
-        leak = leak_frame
-        groups = _group_hypotheses(source_idx, source_fps, leak_fps)
-        decoded = _registration_decode(
-            cv2.cvtColor(fr.astype(np.uint8), cv2.COLOR_GRAY2RGB),
-            cv2.cvtColor(leak.astype(np.uint8), cv2.COLOR_GRAY2RGB),
-            key,
-            reveal_id,
-            groups,
-        )
-        if decoded is not None:
-            uid, metric = decoded
-            return int(uid), float(metric), int(source_idx)
-    return None
-
-
-def extract_video(
-    orig: Path,
-    leak: Path,
-    key: bytes,
-    reveal_id: str,
-    *,
-    max_height: int = 1080,
-    start_frame: int = 0,
-) -> dict:
-    del start_frame
+def extract_video(orig: Path, leak: Path, key: bytes, reveal_id: str, *, max_height: int = 1080, start_frame: int = 0) -> dict:
     samples, leak_fps = _sample_leak_video(leak, max_height)
-    hit = _match_and_decode(
-        orig,
-        samples,
-        leak_fps,
-        key,
-        reveal_id,
-        max_height,
-    )
-    if hit is None:
+    if not samples:
         return _fail(frame=0, time=0.0)
-    uid, metric, frame = hit
     source_fps = _probe_video(orig, max_height)[2]
-    return {
-        "user_id": int(uid),
-        "metric": float(metric),
-        "frame": int(frame),
-        "time": float(frame / max(source_fps, 1.0)),
-        "ok": True,
-        "valid": True,
-    }
+    leak_duration = _video_duration_seconds(leak)
+    source_duration = min(300.0, _video_duration_seconds(orig))
+    ratio = source_duration / leak_duration if leak_duration > 0 and source_duration > 0 else 1.0
+    hints = [idx / max(leak_fps, 1.0) * ratio for idx, _ in samples]
+    if start_frame > 0:
+        hints = [start_frame / max(source_fps, 1.0)]
+    best = None
+    for (hint, (_, sample)) in zip(hints, samples):
+        hit = _exact_video_frame(orig, cv2.cvtColor(sample, cv2.COLOR_GRAY2RGB), hint, key, reveal_id, max_height, leak_fps)
+        if hit is not None and (best is None or hit[1] > best[1]):
+            best = hit
+    if best is None:
+        return _fail(frame=0, time=0.0)
+    uid, metric, frame, actual = best
+    return {"user_id": int(uid), "metric": float(metric), "frame": int(frame), "time": float(actual), "ok": True, "valid": True}
 
 
 def _fail(**extra) -> dict:
