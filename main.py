@@ -1,9 +1,8 @@
-
+import asyncio
 import ipaddress
 import json
 import logging
 import mimetypes
-import asyncio
 import os
 import re
 import secrets
@@ -56,7 +55,12 @@ MAX_UPLOAD_BYTES = int(float(os.getenv("MAX_UPLOAD_MB", "250")) * 1048576)
 MAX_IMAGE_PIXELS = int(float(os.getenv("MAX_IMAGE_MEGAPIXELS", "100")) * 1_000_000)
 UPLOAD_WAIT_SECONDS = int(os.getenv("UPLOAD_WAIT_SECONDS", "90"))
 MAX_URL_BYTES = min(MAX_UPLOAD_BYTES, int(float(os.getenv("MAX_MEDIA_URL_MB", "250")) * 1048576))
-TRACE_TIME_BUDGET = max(15.0, float(os.getenv("TRACE_TIME_BUDGET", "120")))
+# Trace is intentionally bounded so one badly edited leak cannot monopolize the
+# Render instance. The budget is for the whole /trace command; per-kind budgets
+# are ceilings for an individual extractor call.
+TRACE_TIME_BUDGET = max(10.0, float(os.getenv("TRACE_TIME_BUDGET", "45")))
+TRACE_IMAGE_TIME_BUDGET = max(3.0, float(os.getenv("TRACE_IMAGE_TIME_BUDGET", "15")))
+TRACE_VIDEO_TIME_BUDGET = max(5.0, float(os.getenv("TRACE_VIDEO_TIME_BUDGET", "30")))
 TRACE_CACHE_CANDIDATES = max(1, int(os.getenv("TRACE_CACHE_CANDIDATES", "6")))
 AUTO_DELETE_OLD_ORIGINALS = os.getenv("AUTO_DELETE_OLD_ORIGINALS", "false").lower() == "true"
 
@@ -697,7 +701,7 @@ async def send_personalized_reveal(interaction: discord.Interaction) -> None:
 
     if not member_is_booster(interaction.user):
         await interaction.response.send_message(
-            "❌ This reveal is available to current server boosters only.",
+            "âŒ This reveal is available to current server boosters only.",
             ephemeral=True,
         )
         return
@@ -734,7 +738,7 @@ async def send_personalized_reveal(interaction: discord.Interaction) -> None:
         )
     except Exception:
         log.exception("Failed to build reveal for user=%s", interaction.user.id)
-        await fail("❌ I couldn't generate your personalized reveal. Please try again in a moment.")
+        await fail("âŒ I couldn't generate your personalized reveal. Please try again in a moment.")
         return
 
     try:
@@ -743,7 +747,7 @@ async def send_personalized_reveal(interaction: discord.Interaction) -> None:
         size_bytes = 0
     if size_bytes <= 0:
         log.error("Generated reveal is empty: %s", path)
-        await fail("❌ I couldn't generate your personalized reveal. Please try again in a moment.")
+        await fail("âŒ I couldn't generate your personalized reveal. Please try again in a moment.")
         return
     if size_bytes > upload_limit:
         log.error(
@@ -753,13 +757,13 @@ async def send_personalized_reveal(interaction: discord.Interaction) -> None:
             upload_limit,
         )
         await fail(
-            f"❌ The personalized file is too large to send here "
+            f"âŒ The personalized file is too large to send here "
             f"({size_bytes / 1048576:.1f} MB vs a {upload_limit / 1048576:.1f} MB limit)."
         )
         return
 
     filename = "reveal.mp4" if reveal["kind"] == "video" else "reveal.jpg"
-    content = "🎬 Your booster reveal:" if reveal["kind"] == "video" else "🖼️ Your booster reveal:"
+    content = "ðŸŽ¬ Your booster reveal:" if reveal["kind"] == "video" else "ðŸ–¼ï¸ Your booster reveal:"
 
     log.info(
         "Prepared reveal=%s user=%s kind=%s size=%d cached=%s build_seconds=%.2f delivery=%s",
@@ -843,7 +847,7 @@ async def send_personalized_reveal(interaction: discord.Interaction) -> None:
             )
 
     if not delivered:
-        await fail("❌ I couldn't deliver your personalized reveal. Please try again.")
+        await fail("âŒ I couldn't deliver your personalized reveal. Please try again.")
         return
 
     await asyncio.to_thread(ledger_append, reveal["reveal_id"], interaction.user.id)
@@ -856,7 +860,7 @@ class RevealButtonView(discord.ui.View):
     @discord.ui.button(
         label="View Reveal",
         style=discord.ButtonStyle.primary,
-        emoji="👁️",
+        emoji="ðŸ‘ï¸",
         custom_id="revealbot:view-reveal:v1",
     )
     async def view_reveal_button(
@@ -904,7 +908,7 @@ class RevealBot(discord.Client):
         try:
             if len(message.attachments) > 1:
                 await message.delete()
-                await message.channel.send("❌ Upload one file at a time.", delete_after=8)
+                await message.channel.send("âŒ Upload one file at a time.", delete_after=8)
                 return
             if message.attachments:
                 metadata = await save_new_reveal_from_attachment(message.attachments[0])
@@ -913,7 +917,7 @@ class RevealBot(discord.Client):
                 if not match:
                     await message.delete()
                     await message.channel.send(
-                        "❌ Send one direct media URL or one attached file.",
+                        "âŒ Send one direct media URL or one attached file.",
                         delete_after=8,
                     )
                     return
@@ -929,11 +933,11 @@ class RevealBot(discord.Client):
             note = ""
             if metadata.get("truncated_to"):
                 note = (
-                    f"\n⚠️ The source is {metadata['duration']:.0f}s; viewers receive "
+                    f"\nâš ï¸ The source is {metadata['duration']:.0f}s; viewers receive "
                     f"the first {metadata['truncated_to']}s."
                 )
             await message.channel.send(
-                f"✅ Reveal `{metadata['reveal_id']}` is live ({metadata['kind']}). "
+                f"âœ… Reveal `{metadata['reveal_id']}` is live ({metadata['kind']}). "
                 f"Boosters can use `/view_reveal`.{note}",
                 delete_after=12,
             )
@@ -942,7 +946,7 @@ class RevealBot(discord.Client):
                 await message.delete()
             except discord.HTTPException:
                 pass
-            await message.channel.send(f"❌ {exc}", delete_after=10)
+            await message.channel.send(f"âŒ {exc}", delete_after=10)
         except Exception:
             log.exception("Post-/upload ingestion failed.")
             try:
@@ -950,7 +954,7 @@ class RevealBot(discord.Client):
             except discord.HTTPException:
                 pass
             await message.channel.send(
-                "❌ I couldn't ingest that media. Check the bot logs.",
+                "âŒ I couldn't ingest that media. Check the bot logs.",
                 delete_after=10,
             )
 
@@ -1024,7 +1028,7 @@ async def add_reveal_button(interaction: discord.Interaction, message: discord.M
         return
     try:
         await message.reply(
-            content="👁️ Booster reveal — tap the button below to open your private reveal.",
+            content="ðŸ‘ï¸ Booster reveal â€” tap the button below to open your private reveal.",
             view=RevealButtonView(),
             mention_author=False,
             allowed_mentions=discord.AllowedMentions.none(),
@@ -1037,7 +1041,7 @@ async def add_reveal_button(interaction: discord.Interaction, message: discord.M
         )
         return
     await interaction.response.send_message(
-        "✅ Posted a View Reveal button as a reply to the selected message.",
+        "âœ… Posted a View Reveal button as a reply to the selected message.",
         ephemeral=True,
     )
 
@@ -1094,6 +1098,7 @@ async def trace(
     leak_path = TMP_DIR / f"leak_{secrets.token_hex(8)}{ext}"
     try:
         await file.save(leak_path, use_cached=False)
+        trace_deadline = time.monotonic() + TRACE_TIME_BUDGET
         checked = 0
 
         async def trace_original(
@@ -1113,12 +1118,16 @@ async def trace(
                     return None
                 trace_kind = "video_frame" if leak_kind == "image" else "video"
 
+            remaining = trace_deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            kind_budget = TRACE_IMAGE_TIME_BUDGET if trace_kind == "image" or trace_kind == "video_frame" else TRACE_VIDEO_TIME_BUDGET
             kwargs = {
                 "image_cell": IMAGE_CELL,
                 "video_cell": VIDEO_CELL,
                 "max_height": MAX_VIDEO_HEIGHT,
                 "start_frame": int(start_frame),
-                "time_budget": TRACE_TIME_BUDGET,
+                "time_budget": min(kind_budget, remaining),
             }
             if delivery_height is not None:
                 kwargs["delivery_height"] = int(delivery_height)
@@ -1153,14 +1162,22 @@ async def trace(
             return result
 
         for reveal in reveals:
+            if time.monotonic() >= trace_deadline:
+                break
             # Fast/accurate path for video: the personalized cache tells us the exact
             # delivery profile used for a served user, while extraction still compares
             # the leak against the unwatermarked reveal original.
             if reveal["kind"] == "video" and leak_kind in {"image", "video"}:
                 served_ids = set(served_user_ids(reveal["reveal_id"]))
                 profile_attempted: set[tuple[int, float]] = set()
+                profile_paths_checked = 0
                 for served_uid in served_ids:
+                    if time.monotonic() >= trace_deadline or profile_paths_checked >= TRACE_CACHE_CANDIDATES:
+                        break
                     for cached in cached_delivery_paths(reveal["reveal_id"], served_uid):
+                        if time.monotonic() >= trace_deadline or profile_paths_checked >= TRACE_CACHE_CANDIDATES:
+                            break
+                        profile_paths_checked += 1
                         try:
                             profile = wm.video_info(cached, MAX_VIDEO_HEIGHT)
                             profile_key = (int(profile["height"]), round(float(profile["fps"]), 3))
@@ -1191,11 +1208,11 @@ async def trace(
                             continue
 
                         member = await resolve_member(interaction.guild, uid)
-                        frame_text = f" • source frame `{result['frame']}`" if "frame" in result else ""
+                        frame_text = f" â€¢ source frame `{result['frame']}`" if "frame" in result else ""
                         await interaction.followup.send(
-                            f"🔎 Watermark decoded (CRC verified): <@{uid}> (`{uid}`)"
-                            f"{' — in this server' if member else ' — not currently in this server'}\n"
-                            f"Reveal `{reveal['reveal_id']}`{frame_text} • served to this user: **yes**",
+                            f"ðŸ”Ž Watermark decoded (CRC verified): <@{uid}> (`{uid}`)"
+                            f"{' â€” in this server' if member else ' â€” not currently in this server'}\n"
+                            f"Reveal `{reveal['reveal_id']}`{frame_text} â€¢ served to this user: **yes**",
                             ephemeral=True,
                         )
                         log.warning(
@@ -1211,6 +1228,8 @@ async def trace(
 
             # Image delivery does not need a stored delivery profile: registration
             # already recovers resize/crop/translation against the original.
+            if time.monotonic() >= trace_deadline:
+                break
             result = await trace_original(reveal)
             if result is None:
                 continue
@@ -1218,11 +1237,11 @@ async def trace(
             uid = int(result["user_id"])
             served = await asyncio.to_thread(ledger_served, reveal["reveal_id"], uid)
             member = await resolve_member(interaction.guild, uid)
-            frame_text = f" • source frame `{result['frame']}`" if "frame" in result else ""
+            frame_text = f" â€¢ source frame `{result['frame']}`" if "frame" in result else ""
             await interaction.followup.send(
-                f"🔎 Watermark decoded (CRC verified): <@{uid}> (`{uid}`)"
-                f"{' — in this server' if member else ' — not currently in this server'}\n"
-                f"Reveal `{reveal['reveal_id']}`{frame_text} • served to this user: "
+                f"ðŸ”Ž Watermark decoded (CRC verified): <@{uid}> (`{uid}`)"
+                f"{' â€” in this server' if member else ' â€” not currently in this server'}\n"
+                f"Reveal `{reveal['reveal_id']}`{frame_text} â€¢ served to this user: "
                 f"{'**yes**' if served else '**no record**'}",
                 ephemeral=True,
             )
@@ -1235,15 +1254,18 @@ async def trace(
             )
             return
 
+        timed_out = time.monotonic() >= trace_deadline
+        suffix = " The trace time budget was reached before every saved reveal could be checked." if timed_out else ""
         await interaction.followup.send(
             f"No valid watermark found across {checked} trace candidate(s). "
-            f"The leak may be too cropped/edited/compressed or belong to a reveal whose original was deleted.",
+            f"The leak may be too cropped/edited/compressed or belong to a reveal whose original was deleted."
+            f"{suffix}",
             ephemeral=True,
         )
     except Exception:
         log.exception("Trace failed.")
         await interaction.followup.send(
-            "❌ Trace failed. Check the bot logs.",
+            "âŒ Trace failed. Check the bot logs.",
             ephemeral=True,
         )
     finally:
