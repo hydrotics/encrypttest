@@ -1,4 +1,4 @@
-import asyncio
+
 import ipaddress
 import json
 import logging
@@ -55,6 +55,8 @@ MAX_UPLOAD_BYTES = int(float(os.getenv("MAX_UPLOAD_MB", "250")) * 1048576)
 MAX_IMAGE_PIXELS = int(float(os.getenv("MAX_IMAGE_MEGAPIXELS", "100")) * 1_000_000)
 UPLOAD_WAIT_SECONDS = int(os.getenv("UPLOAD_WAIT_SECONDS", "90"))
 MAX_URL_BYTES = min(MAX_UPLOAD_BYTES, int(float(os.getenv("MAX_MEDIA_URL_MB", "250")) * 1048576))
+TRACE_TIME_BUDGET = max(15.0, float(os.getenv("TRACE_TIME_BUDGET", "120")))
+TRACE_CACHE_CANDIDATES = max(1, int(os.getenv("TRACE_CACHE_CANDIDATES", "6")))
 AUTO_DELETE_OLD_ORIGINALS = os.getenv("AUTO_DELETE_OLD_ORIGINALS", "false").lower() == "true"
 
 IMAGE_PREVIEW_MAX_DIM = int(os.getenv("IMAGE_PREVIEW_MAX_DIM", "2048"))
@@ -244,6 +246,38 @@ def ledger_append(reveal_id: str, user_id: int) -> None:
 def ledger_served(reveal_id: str, user_id: int) -> bool:
     with SERVED_INDEX_LOCK:
         return (reveal_id, int(user_id)) in _load_served_index()
+
+
+def served_user_ids(reveal_id: str) -> list[int]:
+    """Return users recorded as having received a reveal, without rescanning JSONL."""
+    with SERVED_INDEX_LOCK:
+        return sorted(
+            int(user_id)
+            for rid, user_id in _load_served_index()
+            if rid == reveal_id
+        )
+
+
+def cached_delivery_paths(reveal_id: str, user_id: int) -> list[Path]:
+    """Return recent personalized cache files for one served user/reveal."""
+    directory = CACHE_DIR / reveal_id
+    if not directory.is_dir():
+        return []
+    prefix = f"user_{int(user_id)}_"
+    try:
+        paths = [
+            p for p in directory.iterdir()
+            if p.is_file()
+            and p.name.startswith(prefix)
+            and p.suffix.lower() in IMAGE_EXTS | {".mp4"}
+        ]
+    except OSError:
+        return []
+    paths.sort(
+        key=lambda p: p.stat().st_mtime_ns if p.exists() else 0,
+        reverse=True,
+    )
+    return paths[:TRACE_CACHE_CANDIDATES]
 
 
 def compute_video_target_bytes(upload_limit: Optional[int]) -> int:
@@ -1060,14 +1094,38 @@ async def trace(
     try:
         await file.save(leak_path, use_cached=False)
         checked = 0
-        for reveal in reveals:
-            if reveal["kind"] == "image" and leak_kind != "image":
-                continue
-            if reveal["kind"] == "video" and leak_kind not in {"image", "video"}:
-                continue
+
+        async def trace_original(
+            reveal: dict,
+            *,
+            delivery_height: Optional[int] = None,
+            delivery_fps: Optional[float] = None,
+        ) -> Optional[dict]:
+            nonlocal checked
+
+            if reveal["kind"] == "image":
+                if leak_kind != "image":
+                    return None
+                trace_kind = "image"
+            else:
+                if leak_kind not in {"image", "video"}:
+                    return None
+                trace_kind = "video_frame" if leak_kind == "image" else "video"
+
+            kwargs = {
+                "image_cell": IMAGE_CELL,
+                "video_cell": VIDEO_CELL,
+                "max_height": MAX_VIDEO_HEIGHT,
+                "start_frame": int(start_frame),
+                "time_budget": TRACE_TIME_BUDGET,
+            }
+            if delivery_height is not None:
+                kwargs["delivery_height"] = int(delivery_height)
+            if delivery_fps is not None:
+                kwargs["delivery_fps"] = float(delivery_fps)
+
             checked += 1
             try:
-                trace_kind = "video_frame" if reveal["kind"] == "video" and leak_kind == "image" else leak_kind
                 async with PROCESS_SEMAPHORE:
                     result = await asyncio.to_thread(
                         wm.extract,
@@ -1076,15 +1134,84 @@ async def trace(
                         trace_kind,
                         WM_KEY,
                         reveal["reveal_id"],
-                        image_cell=IMAGE_CELL,
-                        video_cell=VIDEO_CELL,
-                        max_height=MAX_VIDEO_HEIGHT,
-                        start_frame=int(start_frame),
+                        **kwargs,
                     )
             except Exception as exc:
-                log.info("Reveal %s did not decode: %s", reveal["reveal_id"], exc)
-                continue
+                log.info(
+                    "Reveal %s did not decode with profile h=%s fps=%s: %s",
+                    reveal["reveal_id"],
+                    delivery_height,
+                    delivery_fps,
+                    exc,
+                )
+                return None
+
             if not result.get("valid"):
+                return None
+
+            return result
+
+        for reveal in reveals:
+            # Fast/accurate path for video: the personalized cache tells us the exact
+            # delivery profile used for a served user, while extraction still compares
+            # the leak against the unwatermarked reveal original.
+            if reveal["kind"] == "video" and leak_kind in {"image", "video"}:
+                served_ids = set(served_user_ids(reveal["reveal_id"]))
+                profile_attempted: set[tuple[int, float]] = set()
+                for served_uid in served_ids:
+                    for cached in cached_delivery_paths(reveal["reveal_id"], served_uid):
+                        try:
+                            profile = wm.video_info(cached, MAX_VIDEO_HEIGHT)
+                            profile_key = (int(profile["height"]), round(float(profile["fps"]), 3))
+                        except Exception as exc:
+                            log.info("Could not read delivery profile %s: %s", cached, exc)
+                            continue
+                        if profile_key in profile_attempted:
+                            continue
+                        profile_attempted.add(profile_key)
+
+                        result = await trace_original(
+                            reveal,
+                            delivery_height=profile_key[0],
+                            delivery_fps=profile_key[1],
+                        )
+                        if result is None:
+                            continue
+
+                        uid = int(result["user_id"])
+                        if uid not in served_ids:
+                            log.info(
+                                "Trace decoded unserved user=%s for reveal=%s profile=%sx%.3ffps",
+                                uid,
+                                reveal["reveal_id"],
+                                profile_key[0],
+                                profile_key[1],
+                            )
+                            continue
+
+                        member = await resolve_member(interaction.guild, uid)
+                        frame_text = f" • source frame `{result['frame']}`" if "frame" in result else ""
+                        await interaction.followup.send(
+                            f"🔎 Watermark decoded (CRC verified): <@{uid}> (`{uid}`)"
+                            f"{' — in this server' if member else ' — not currently in this server'}\n"
+                            f"Reveal `{reveal['reveal_id']}`{frame_text} • served to this user: **yes**",
+                            ephemeral=True,
+                        )
+                        log.warning(
+                            "TRACE by %s: reveal=%s decoded_user=%s checked=%d source=original profile=%sx%.3ffps",
+                            interaction.user.id,
+                            reveal["reveal_id"],
+                            uid,
+                            checked,
+                            profile_key[0],
+                            profile_key[1],
+                        )
+                        return
+
+            # Image delivery does not need a stored delivery profile: registration
+            # already recovers resize/crop/translation against the original.
+            result = await trace_original(reveal)
+            if result is None:
                 continue
 
             uid = int(result["user_id"])
@@ -1099,7 +1226,7 @@ async def trace(
                 ephemeral=True,
             )
             log.warning(
-                "TRACE by %s: reveal=%s decoded_user=%s checked=%d",
+                "TRACE by %s: reveal=%s decoded_user=%s checked=%d source=original",
                 interaction.user.id,
                 reveal["reveal_id"],
                 uid,
@@ -1108,7 +1235,7 @@ async def trace(
             return
 
         await interaction.followup.send(
-            f"No valid watermark found across {checked} saved reveal(s). "
+            f"No valid watermark found across {checked} trace candidate(s). "
             f"The leak may be too cropped/edited/compressed or belong to a reveal whose original was deleted.",
             ephemeral=True,
         )
