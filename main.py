@@ -2,6 +2,7 @@ import asyncio
 import ipaddress
 import json
 import logging
+import mimetypes
 import os
 import re
 import secrets
@@ -13,7 +14,6 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urljoin, urlparse
-import mimetypes
 
 import aiohttp
 import discord
@@ -39,11 +39,14 @@ BOOSTER_ROLE_ID = int(os.getenv("BOOSTER_ROLE_ID", "0") or 0)
 MAX_CONCURRENT_JOBS = max(1, int(os.getenv("MAX_CONCURRENT_JOBS", "2")))
 MAX_VIDEO_SECONDS = int(os.getenv("MAX_VIDEO_SECONDS", "300"))
 MAX_VIDEO_HEIGHT = int(os.getenv("MAX_VIDEO_HEIGHT", "1080"))
-VIDEO_PRESET = os.getenv("VIDEO_PRESET", "fast")
+VIDEO_PRESET = os.getenv("VIDEO_PRESET", "auto").strip().lower()
 VIDEO_AUDIO_KBPS = int(os.getenv("VIDEO_AUDIO_KBPS", "96"))
-VIDEO_TARGET_MAX_MB = float(os.getenv("VIDEO_TARGET_MAX_MB", "500"))
+# Keep delivered videos modest: large files are what stall on mobile data.
+VIDEO_TARGET_MAX_MB = float(os.getenv("VIDEO_TARGET_MAX_MB", "95"))
+DEFAULT_UPLOAD_LIMIT = 20 * 1048576  # Current Discord API baseline when no limit is reported.
 VIDEO_MAX_BPP = float(os.getenv("VIDEO_MAX_BPP", str(wm.MAX_BITS_PER_PIXEL)))
-VIDEO_CACHE_VERSION = f"{os.getenv('VIDEO_CACHE_VERSION', 'v16')}-h264-high-mobile-v2"
+# Bump this when the encoded-cache naming/target semantics change.
+VIDEO_CACHE_VERSION = f"{os.getenv('VIDEO_CACHE_VERSION', 'v21')}-quality-first-crf-trace-v2"
 IMAGE_AMP = float(os.getenv("WM_IMAGE_AMP", "3.0"))
 IMAGE_CELL = int(os.getenv("WM_IMAGE_CELL", "4"))
 VIDEO_AMP = float(os.getenv("WM_VIDEO_AMP", "3.0"))
@@ -56,7 +59,7 @@ AUTO_DELETE_OLD_ORIGINALS = os.getenv("AUTO_DELETE_OLD_ORIGINALS", "false").lowe
 
 IMAGE_PREVIEW_MAX_DIM = int(os.getenv("IMAGE_PREVIEW_MAX_DIM", "2048"))
 IMAGE_PREVIEW_QUALITY = int(os.getenv("IMAGE_PREVIEW_QUALITY", "92"))
-IMAGE_CACHE_VERSION = os.getenv("IMAGE_CACHE_VERSION", "mobile-jpeg-v2")
+IMAGE_CACHE_VERSION = os.getenv("IMAGE_CACHE_VERSION", "fullres-jpeg-444-v1")
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "/var/data" if Path("/var/data").is_dir() else "data"))
 REVEALS_DIR = DATA_DIR / "reveals"
@@ -71,13 +74,36 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"}
 REVEAL_ID_RE = re.compile(r"^\d+_[0-9a-f]{8}$")
 URL_RE = re.compile(r"https?://[^\s<>]+", re.I)
+HTTP_USER_AGENT = "RevealBot/1.0 (+https://discord.com/)"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("revealbot")
 
 PROCESS_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
-USER_LOCKS: dict[tuple[str, int], asyncio.Lock] = defaultdict(asyncio.Lock)
+# One build lock per user is enough because the bot only serves CURRENT_REVEAL.
+# Keeping the lock object avoids a race where an old waiter and a new request get
+# different locks for the same user.
+USER_LOCKS: dict[int, asyncio.Lock] = {}
+USER_LOCKS_GUARD = threading.Lock()
 PENDING_UPLOADS: dict[tuple[int, int, int], float] = {}
+
+
+def _prune_pending_uploads() -> None:
+    now = time.monotonic()
+    for key, deadline in list(PENDING_UPLOADS.items()):
+        if deadline <= now:
+            PENDING_UPLOADS.pop(key, None)
+
+
+# Protects AUTO_DELETE_OLD_ORIGINALS/cache pruning from removing a reveal while a
+# personalized build is still reading it.
+ACTIVE_REVEALS: defaultdict[str, int] = defaultdict(int)
+ACTIVE_REVEALS_LOCK = threading.Lock()
+
+# The served ledger can grow over time. Index it once instead of scanning the whole
+# JSONL file for every /trace request.
+SERVED_INDEX: Optional[set[tuple[str, int]]] = None
+SERVED_INDEX_LOCK = threading.RLock()
 
 
 class RevealRejected(Exception):
@@ -85,15 +111,26 @@ class RevealRejected(Exception):
 
 
 def safe_json_write(path: Path, payload: dict) -> None:
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    # Write to a sibling temp file then replace atomically so a crash cannot leave
+    # metadata half-written.
+    tmp = path.with_name(f".{path.name}.{secrets.token_hex(4)}.tmp")
+    try:
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        with tmp.open("r+b") as fh:
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _original_in(directory: Path) -> Optional[Path]:
-    for f in directory.glob("original.*"):
-        if f.is_file() and f.suffix.lower() in IMAGE_EXTS | VIDEO_EXTS:
-            return f
+    try:
+        for f in directory.glob("original.*"):
+            if f.is_file() and f.suffix.lower() in IMAGE_EXTS | VIDEO_EXTS:
+                return f
+    except OSError:
+        log.exception("Could not inspect reveal directory %s", directory)
     return None
 
 
@@ -117,21 +154,31 @@ def _metadata_for(directory: Path) -> Optional[dict]:
 
 
 def all_reveals() -> list[dict]:
-    out = []
-    for directory in REVEALS_DIR.iterdir():
+    out: list[dict] = []
+    try:
+        directories = list(REVEALS_DIR.iterdir())
+    except OSError:
+        log.exception("Could not list %s", REVEALS_DIR)
+        return out
+
+    for directory in directories:
         if not directory.is_dir() or not REVEAL_ID_RE.fullmatch(directory.name):
             continue
-        row = _metadata_for(directory)
-        if row and Path(row["path"]).exists():
-            out.append(row)
-    return sorted(out, key=lambda r: int(r.get("created_at", 0)), reverse=True)
+        try:
+            row = _metadata_for(directory)
+            if row and Path(row["path"]).is_file():
+                out.append(row)
+        except OSError:
+            # A concurrent prune/delete can legitimately make a directory vanish.
+            continue
+    return sorted(out, key=lambda r: int(r.get("created_at", 0) or 0), reverse=True)
 
 
 def load_current_reveal() -> Optional[dict]:
     try:
         if META_FILE.exists():
             row = json.loads(META_FILE.read_text(encoding="utf-8"))
-            if Path(row.get("path", "")).exists():
+            if Path(row.get("path", "")).is_file():
                 return row
     except Exception:
         log.exception("Could not read %s", META_FILE)
@@ -148,7 +195,7 @@ def find_reveals(reveal_id: Optional[str]) -> list[dict]:
             return []
         directory = REVEALS_DIR / reveal_id
         row = _metadata_for(directory) if directory.is_dir() else None
-        return [row] if row and Path(row["path"]).exists() else []
+        return [row] if row and Path(row["path"]).is_file() else []
     return all_reveals()
 
 
@@ -156,48 +203,65 @@ def member_is_booster(member: discord.Member) -> bool:
     return bool(BOOSTER_ROLE_ID and any(r.id == BOOSTER_ROLE_ID for r in member.roles)) or member.premium_since is not None
 
 
+def _load_served_index() -> set[tuple[str, int]]:
+    global SERVED_INDEX
+    if SERVED_INDEX is not None:
+        return SERVED_INDEX
+    index: set[tuple[str, int]] = set()
+    if LEDGER_FILE.exists():
+        try:
+            with LEDGER_FILE.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    if not line.strip():
+                        continue
+                    try:
+                        row = json.loads(line)
+                        reveal_id = row.get("reveal_id")
+                        user_id = row.get("user_id")
+                        if isinstance(reveal_id, str) and user_id is not None:
+                            index.add((reveal_id, int(user_id)))
+                    except (ValueError, TypeError, json.JSONDecodeError):
+                        continue
+        except OSError:
+            log.exception("Could not read ledger while building its index.")
+    SERVED_INDEX = index
+    return index
+
+
 def ledger_append(reveal_id: str, user_id: int) -> None:
+    row = (reveal_id, int(user_id))
     try:
-        with LEDGER_FILE.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps({"ts": int(time.time()), "reveal_id": reveal_id, "user_id": int(user_id)}) + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
+        with SERVED_INDEX_LOCK:
+            with LEDGER_FILE.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"ts": int(time.time()), "reveal_id": reveal_id, "user_id": int(user_id)}) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            _load_served_index().add(row)
     except OSError:
         log.exception("Could not write ledger.")
 
 
 def ledger_served(reveal_id: str, user_id: int) -> bool:
-    if not LEDGER_FILE.exists():
-        return False
-    try:
-        with LEDGER_FILE.open("r", encoding="utf-8") as fh:
-            for line in fh:
-                if not line.strip():
-                    continue
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if row.get("reveal_id") == reveal_id and int(row.get("user_id", -1)) == int(user_id):
-                    return True
-    except OSError:
-        log.exception("Could not read ledger.")
-    return False
+    with SERVED_INDEX_LOCK:
+        return (reveal_id, int(user_id)) in _load_served_index()
 
 
 def compute_video_target_bytes(upload_limit: Optional[int]) -> int:
-    configured = int(VIDEO_TARGET_MAX_MB * 1048576)
+    configured = int(max(1.0, VIDEO_TARGET_MAX_MB) * 1048576)
     if not upload_limit or upload_limit <= 0:
         return configured
+    # Leave a little room under Discord's hard limit so encoder/container overhead
+    # and any minor size drift do not turn a successful encode into a failed upload.
     margin = min(512 * 1024, max(128 * 1024, int(upload_limit * 0.025)))
-    return min(configured, max(1, int(upload_limit) - margin))
+    return min(configured, max(256 * 1024, int(upload_limit) - margin))
 
 
 def is_allowed_media(filename: str, content_type: Optional[str]) -> tuple[bool, Optional[str], Optional[str]]:
     ext = Path(filename).suffix.lower()
-    if ext in IMAGE_EXTS or (content_type and content_type.startswith("image/") and content_type != "image/gif"):
+    normalized_type = (content_type or "").split(";", 1)[0].strip().lower()
+    if ext in IMAGE_EXTS or (normalized_type.startswith("image/") and normalized_type != "image/gif"):
         return True, "image", ext if ext in IMAGE_EXTS else ".png"
-    if ext in VIDEO_EXTS or (content_type and content_type.startswith("video/")):
+    if ext in VIDEO_EXTS or normalized_type.startswith("video/"):
         return True, "video", ext if ext in VIDEO_EXTS else ".mp4"
     return False, None, None
 
@@ -207,8 +271,11 @@ def validate_media(path: Path, kind: str) -> dict:
         try:
             with Image.open(path) as probe:
                 width, height = probe.size
-            if width * height > MAX_IMAGE_PIXELS:
-                raise RevealRejected(f"That image is {width * height / 1e6:.0f} MP; the limit is {MAX_IMAGE_PIXELS / 1e6:.0f} MP.")
+                pixels = width * height
+            if pixels > MAX_IMAGE_PIXELS:
+                raise RevealRejected(
+                    f"That image is {pixels / 1e6:.0f} MP; the limit is {MAX_IMAGE_PIXELS / 1e6:.0f} MP."
+                )
             wm._load_rgb(path)
             return {"width": width, "height": height}
         except RevealRejected:
@@ -246,9 +313,6 @@ async def _save_reveal_file(src: Path, filename: str, kind: str, normalized_ext:
         safe_json_write(META_FILE, metadata)
         CURRENT_REVEAL = metadata
         await asyncio.to_thread(prune_old_data, reveal_id)
-        for key in list(USER_LOCKS):
-            if key[0] != reveal_id:
-                USER_LOCKS.pop(key, None)
         return metadata
     except Exception:
         shutil.rmtree(directory, ignore_errors=True)
@@ -260,7 +324,9 @@ async def save_new_reveal_from_attachment(attachment: discord.Attachment) -> dic
     if not ok:
         raise RevealRejected("Please send an image (jpg/png/webp) or a video (mp4/mov/webm/mkv/avi/m4v).")
     if attachment.size > MAX_UPLOAD_BYTES:
-        raise RevealRejected(f"That file is {attachment.size / 1048576:.0f} MB; the limit is {MAX_UPLOAD_BYTES / 1048576:.0f} MB.")
+        raise RevealRejected(
+            f"That file is {attachment.size / 1048576:.0f} MB; the limit is {MAX_UPLOAD_BYTES / 1048576:.0f} MB."
+        )
     tmp = TMP_DIR / f"upload_{secrets.token_hex(8)}{ext}"
     try:
         await attachment.save(tmp, use_cached=False)
@@ -270,13 +336,15 @@ async def save_new_reveal_from_attachment(attachment: discord.Attachment) -> dic
 
 
 def _public_ip(host: str) -> bool:
+    """Return True only if every resolved address is globally routable.
+
+    This is deliberately conservative: a hostname that resolves to a mix of
+    public and private/link-local addresses is rejected rather than risking SSRF.
+    """
     try:
         infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
-        for item in infos:
-            ip = ipaddress.ip_address(item[4][0].split("%", 1)[0])
-            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
-                return False
-        return True
+        addresses = {ipaddress.ip_address(item[4][0].split("%", 1)[0]) for item in infos}
+        return bool(addresses) and all(ip.is_global for ip in addresses)
     except (socket.gaierror, ValueError):
         return False
 
@@ -285,24 +353,45 @@ async def download_media_url(url: str) -> tuple[Path, str, str, str]:
     current = url.strip().strip("<>")
     if not URL_RE.fullmatch(current):
         raise RevealRejected("Send one direct http(s) media URL.")
+
     timeout = aiohttp.ClientTimeout(total=180, connect=15, sock_read=45)
+    connector = aiohttp.TCPConnector(limit=4, limit_per_host=2, ttl_dns_cache=30)
     path: Optional[Path] = None
     try:
-        async with aiohttp.ClientSession(timeout=timeout, raise_for_status=False) as session:
+        async with aiohttp.ClientSession(
+            timeout=timeout,
+            connector=connector,
+            raise_for_status=False,
+            headers={"User-Agent": HTTP_USER_AGENT},
+        ) as session:
             for _ in range(5):
                 parsed = urlparse(current)
-                if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname or not _public_ip(parsed.hostname):
+                if (
+                    parsed.scheme.lower() not in {"http", "https"}
+                    or not parsed.hostname
+                    or parsed.username is not None
+                    or parsed.password is not None
+                    or not await asyncio.to_thread(_public_ip, parsed.hostname)
+                ):
                     raise RevealRejected("That media URL is not allowed.")
+
                 async with session.get(current, allow_redirects=False) as response:
                     if 300 <= response.status < 400 and response.headers.get("Location"):
                         current = urljoin(current, response.headers["Location"])
                         continue
                     if response.status != 200:
                         raise RevealRejected(f"The media URL returned HTTP {response.status}.")
-                    content_type = (response.headers.get("Content-Type") or "").split(";", 1)[0].lower()
-                    size = int(response.headers.get("Content-Length", "0") or 0)
+
+                    content_type = (response.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+                    try:
+                        size = int(response.headers.get("Content-Length", "0") or 0)
+                    except ValueError:
+                        size = 0
                     if size > MAX_URL_BYTES:
-                        raise RevealRejected(f"That URL points to {size / 1048576:.0f} MB; the limit is {MAX_URL_BYTES / 1048576:.0f} MB.")
+                        raise RevealRejected(
+                            f"That URL points to {size / 1048576:.0f} MB; the limit is {MAX_URL_BYTES / 1048576:.0f} MB."
+                        )
+
                     ext = Path(parsed.path).suffix.lower()
                     if ext not in IMAGE_EXTS | VIDEO_EXTS:
                         ext = mimetypes.guess_extension(content_type) or ""
@@ -310,6 +399,7 @@ async def download_media_url(url: str) -> tuple[Path, str, str, str]:
                     ok, kind, normalized_ext = is_allowed_media(fake_name, content_type)
                     if not ok:
                         raise RevealRejected("The URL does not point to a supported image or video.")
+
                     path = TMP_DIR / f"url_{secrets.token_hex(8)}{normalized_ext}"
                     written = 0
                     with path.open("wb") as fh:
@@ -327,11 +417,15 @@ async def download_media_url(url: str) -> tuple[Path, str, str, str]:
         if path:
             path.unlink(missing_ok=True)
         raise RevealRejected(f"I couldn't download that media URL ({type(exc).__name__}).") from exc
+    finally:
+        # The connector is owned by this short-lived session, so there is no
+        # separate close operation needed here.
+        pass
     raise RevealRejected("Too many redirects.")
 
 
 async def save_new_reveal_from_url(url: str) -> dict:
-    path = None
+    path: Optional[Path] = None
     try:
         path, kind, ext, filename = await download_media_url(url)
         return await _save_reveal_file(path, filename, kind, ext)
@@ -340,16 +434,48 @@ async def save_new_reveal_from_url(url: str) -> dict:
             path.unlink(missing_ok=True)
 
 
+def _active_reveal(reveal_id: str, delta: int) -> None:
+    with ACTIVE_REVEALS_LOCK:
+        ACTIVE_REVEALS[reveal_id] += delta
+        if ACTIVE_REVEALS[reveal_id] <= 0:
+            ACTIVE_REVEALS.pop(reveal_id, None)
+
+
 def prune_old_data(keep_reveal_id: str) -> None:
-    for child in CACHE_DIR.iterdir():
-        if child.is_dir() and child.name != keep_reveal_id:
-            shutil.rmtree(child, ignore_errors=True)
+    try:
+        cache_children = list(CACHE_DIR.iterdir())
+    except OSError:
+        cache_children = []
+
+    for child in cache_children:
+        if not child.is_dir() or child.name == keep_reveal_id:
+            continue
+        with ACTIVE_REVEALS_LOCK:
+            active = child.name in ACTIVE_REVEALS
+        if active:
+            continue
+        shutil.rmtree(child, ignore_errors=True)
+
     if AUTO_DELETE_OLD_ORIGINALS:
-        for directory in REVEALS_DIR.iterdir():
-            if directory.is_dir() and directory.name != keep_reveal_id:
-                shutil.rmtree(directory, ignore_errors=True)
+        try:
+            reveal_children = list(REVEALS_DIR.iterdir())
+        except OSError:
+            reveal_children = []
+        for directory in reveal_children:
+            if not directory.is_dir() or directory.name == keep_reveal_id:
+                continue
+            with ACTIVE_REVEALS_LOCK:
+                active = directory.name in ACTIVE_REVEALS
+            if active:
+                continue
+            shutil.rmtree(directory, ignore_errors=True)
+
     cutoff = time.time() - 3600
-    for leftover in TMP_DIR.iterdir():
+    try:
+        leftovers = list(TMP_DIR.iterdir())
+    except OSError:
+        leftovers = []
+    for leftover in leftovers:
         try:
             if leftover.is_file() and leftover.stat().st_mtime < cutoff:
                 leftover.unlink(missing_ok=True)
@@ -357,70 +483,177 @@ def prune_old_data(keep_reveal_id: str) -> None:
             pass
 
 
-def _build_sync(source: Path, kind: str, output: Path, user_id: int, reveal_id: str,
-                target_bytes: Optional[int]) -> dict:
+def _select_video_preset(source: Path) -> str:
+    """Choose an encoder preset that preserves more quality at the same size budget."""
+    configured = VIDEO_PRESET or "auto"
+    if configured != "auto":
+        return configured
+
+    try:
+        info = wm.video_info(source, MAX_VIDEO_HEIGHT)
+        duration = float(info.get("duration", 0.0) or 0.0)
+    except Exception:
+        duration = 0.0
+
+    # Faster presets spend more CPU-saving shortcuts for encoding speed; slower
+    # presets generally use the available bitrate more efficiently. Long videos
+    # benefit most because they have fewer bits per second under the same target.
+    if duration >= 180:
+        return "slow"
+    if duration >= 75:
+        return "medium"
+    return "fast"
+
+
+def _build_sync(
+    source: Path,
+    kind: str,
+    output: Path,
+    user_id: int,
+    reveal_id: str,
+    target_bytes: Optional[int],
+) -> dict:
     started = time.perf_counter()
     if kind == "image":
-        wm.render_image_preview(
-            source, output, user_id, WM_KEY, reveal_id,
-            amp=IMAGE_AMP, max_dim=IMAGE_PREVIEW_MAX_DIM, quality=IMAGE_PREVIEW_QUALITY,
+        info = wm.render_image_delivery(
+            source,
+            output,
+            user_id,
+            WM_KEY,
+            reveal_id,
+            amp=IMAGE_AMP,
+            target_bytes=target_bytes,
         )
-        info = {}
     else:
+        preset = _select_video_preset(source)
         info = wm.embed_video(
-            source, output, user_id, WM_KEY, reveal_id,
-            amp=VIDEO_AMP, preset=VIDEO_PRESET, max_seconds=MAX_VIDEO_SECONDS,
-            max_height=MAX_VIDEO_HEIGHT, target_bytes=target_bytes,
-            audio_kbps=VIDEO_AUDIO_KBPS, max_bpp=VIDEO_MAX_BPP,
+            source,
+            output,
+            user_id,
+            WM_KEY,
+            reveal_id,
+            amp=VIDEO_AMP,
+            preset=preset,
+            max_seconds=MAX_VIDEO_SECONDS,
+            max_height=MAX_VIDEO_HEIGHT,
+            target_bytes=target_bytes,
+            audio_kbps=VIDEO_AUDIO_KBPS,
+            max_bpp=VIDEO_MAX_BPP,
         )
+        info["preset"] = preset
     info["seconds"] = round(time.perf_counter() - started, 1)
     return info
 
 
+def _get_user_lock(user_id: int) -> asyncio.Lock:
+    # Accessed on the bot event loop in normal operation; a tiny guard also makes
+    # startup/tests that call this helper from different threads deterministic.
+    with USER_LOCKS_GUARD:
+        return USER_LOCKS.setdefault(user_id, asyncio.Lock())
+
+
 def cache_path_for(reveal: dict, user_id: int, target_bytes: Optional[int]) -> Path:
     base = CACHE_DIR / reveal["reveal_id"]
+    target_token = str(int(target_bytes or 0))
     if reveal["kind"] == "video":
-        target_mb = int(round((target_bytes or 0) / 1048576))
-        return base / f"user_{user_id}_{VIDEO_CACHE_VERSION}_{target_mb}mb.mp4"
-    return base / f"user_{user_id}_{IMAGE_CACHE_VERSION}.jpg"
+        # Use the exact target, not rounded MBs. Two Discord limits that differ by
+        # less than 1 MB must never share a cache entry because the larger file can
+        # be rejected by the smaller limit.
+        return base / f"user_{user_id}_{VIDEO_CACHE_VERSION}_{target_token}b.mp4"
+    return base / f"user_{user_id}_{IMAGE_CACHE_VERSION}_{target_token}b.jpg"
 
 
 def _ready(path: Path) -> bool:
     try:
-        return path.stat().st_size > 0
+        return path.is_file() and path.stat().st_size > 0
     except OSError:
         return False
 
 
-async def build_personalized_reveal(reveal: dict, user_id: int, *, video_target_bytes: Optional[int] = None) -> tuple[Path, bool]:
-    source = Path(reveal["path"])
-    if not source.exists():
-        raise RuntimeError("There is currently no valid reveal.")
-    output = cache_path_for(reveal, user_id, video_target_bytes)
-    if _ready(output):
-        return output, True
-    async with USER_LOCKS[(reveal["reveal_id"], user_id)]:
+async def build_personalized_reveal(
+    reveal: dict,
+    user_id: int,
+    *,
+    video_target_bytes: Optional[int] = None,
+) -> tuple[Path, bool]:
+    # Mark the reveal active before taking the user lock. A new upload can arrive
+    # while an existing interaction is queued behind another build; pruning must
+    # not delete that interaction's source in the meantime.
+    _active_reveal(reveal["reveal_id"], +1)
+    try:
+        source = Path(reveal["path"])
+        if not source.is_file():
+            raise RuntimeError("There is currently no valid reveal.")
+
+        output = cache_path_for(reveal, user_id, video_target_bytes)
         if _ready(output):
             return output, True
-        async with PROCESS_SEMAPHORE:
-            output.parent.mkdir(parents=True, exist_ok=True)
-            tmp = output.with_name(f"{output.stem}.tmp{output.suffix}")
-            try:
-                info = await asyncio.to_thread(
-                    _build_sync, source, reveal["kind"], tmp, user_id,
-                    reveal["reveal_id"], video_target_bytes
-                )
-                tmp.replace(output)
-            finally:
-                tmp.unlink(missing_ok=True)
-    log.info("Built %s reveal=%s user=%s %s", reveal["kind"], reveal["reveal_id"], user_id, info)
-    return output, False
+
+        async with _get_user_lock(user_id):
+            if _ready(output):
+                return output, True
+            async with PROCESS_SEMAPHORE:
+                output.parent.mkdir(parents=True, exist_ok=True)
+                tmp = output.with_name(f".{output.stem}.tmp{secrets.token_hex(4)}{output.suffix}")
+                try:
+                    info = await asyncio.to_thread(
+                        _build_sync,
+                        source,
+                        reveal["kind"],
+                        tmp,
+                        user_id,
+                        reveal["reveal_id"],
+                        video_target_bytes,
+                    )
+                    if not _ready(tmp):
+                        raise RuntimeError("The watermark encoder produced an empty file.")
+                    tmp.replace(output)
+                finally:
+                    tmp.unlink(missing_ok=True)
+
+        log.info("Built %s reveal=%s user=%s %s", reveal["kind"], reveal["reveal_id"], user_id, info)
+        return output, False
+    finally:
+        _active_reveal(reveal["reveal_id"], -1)
 
 
+def _components_v2_available() -> bool:
+    """Return whether this discord.py build can render attached video in a MediaGallery."""
+    return (
+        hasattr(discord.ui, "LayoutView")
+        and hasattr(discord.ui, "MediaGallery")
+        and hasattr(discord.ui, "TextDisplay")
+        and hasattr(discord, "MediaGalleryItem")
+    )
+
+
+def _build_media_gallery_view(filename: str, content: str):
+    """Build a Components V2 media gallery around a locally uploaded attachment.
+
+    Discord's current Components V2 MediaGallery supports video attachments via
+    attachment://filename. This changes presentation only; the underlying MP4 is
+    sent byte-for-byte from the existing personalized cache.
+    """
+    view = discord.ui.LayoutView(timeout=15 * 60)
+    view.add_item(discord.ui.TextDisplay(content))
+    gallery = discord.ui.MediaGallery()
+    gallery.add_item(
+        media=f"attachment://{filename}",
+        description="Your private booster reveal",
+        spoiler=False,
+    )
+    view.add_item(gallery)
+    return view
 
 
 async def send_personalized_reveal(interaction: discord.Interaction) -> None:
-    """Generate one personalized file and deliver it as one ephemeral Discord attachment."""
+    """Build one personalized file and deliver it privately.
+
+    Images and videos use a Components V2 MediaGallery when the installed discord.py
+    supports it. This changes only the Discord presentation layer and does not
+    re-encode the cached media. Older discord.py versions fall back to a normal
+    attachment.
+    """
     if not isinstance(interaction.user, discord.Member):
         await interaction.response.send_message(
             "I couldn't verify your server membership.", ephemeral=True
@@ -435,108 +668,148 @@ async def send_personalized_reveal(interaction: discord.Interaction) -> None:
         return
 
     reveal = CURRENT_REVEAL
-    if not reveal or not Path(reveal["path"]).exists():
+    if not reveal or not Path(reveal["path"]).is_file():
         await interaction.response.send_message(
             "There isn't a reveal uploaded right now.", ephemeral=True
         )
         return
 
-    upload_limit = getattr(interaction, "filesize_limit", None)
-    if upload_limit is None and interaction.guild is not None:
-        upload_limit = getattr(interaction.guild, "filesize_limit", None)
-    target = compute_video_target_bytes(upload_limit) if reveal["kind"] == "video" else None
+    upload_limit = (
+        getattr(interaction, "filesize_limit", None)
+        or getattr(interaction, "attachment_size_limit", None)
+        or (getattr(interaction.guild, "filesize_limit", None) if interaction.guild else None)
+        or DEFAULT_UPLOAD_LIMIT
+    )
+    target = compute_video_target_bytes(upload_limit)
 
-    # Discord interactions must be acknowledged quickly. Defer once, do the build,
-    # then replace that same ephemeral response with the actual attachment.
     await interaction.response.defer(ephemeral=True, thinking=True)
     started = time.perf_counter()
+
+    async def fail(text: str) -> None:
+        try:
+            await interaction.edit_original_response(content=text, attachments=[], view=None)
+        except discord.HTTPException:
+            log.exception("Could not report reveal failure to user=%s", interaction.user.id)
+
     try:
         path, cached = await build_personalized_reveal(
-            reveal, interaction.user.id, video_target_bytes=target
+            reveal,
+            interaction.user.id,
+            video_target_bytes=target,
         )
-    except Exception as exc:
+    except Exception:
         log.exception("Failed to build reveal for user=%s", interaction.user.id)
-        await interaction.edit_original_response(
-            content=f"❌ I couldn't generate your personalized reveal: {exc}",
-            attachments=[],
-        )
+        await fail("❌ I couldn't generate your personalized reveal. Please try again in a moment.")
         return
 
     try:
         size_bytes = path.stat().st_size
-        if size_bytes <= 0:
-            raise RuntimeError("The generated reveal is empty.")
-        if upload_limit and size_bytes > upload_limit:
-            await interaction.edit_original_response(
-                content=(
-                    f"❌ The personalized file is too large ({size_bytes / 1048576:.1f} MB vs "
-                    f"the {upload_limit / 1048576:.1f} MB attachment limit)."
-                ),
-                attachments=[],
-            )
-            return
-
-        filename = "reveal.mp4" if reveal["kind"] == "video" else "reveal.jpg"
-        content = (
-            "🎬 Booster reveal attached below."
-            if reveal["kind"] == "video"
-            else "🖼️ Booster reveal attached below."
+    except OSError:
+        size_bytes = 0
+    if size_bytes <= 0:
+        log.error("Generated reveal is empty: %s", path)
+        await fail("❌ I couldn't generate your personalized reveal. Please try again in a moment.")
+        return
+    if size_bytes > upload_limit:
+        log.error(
+            "Reveal %s is %d bytes, over the %d byte limit",
+            path,
+            size_bytes,
+            upload_limit,
         )
-
-        log.info(
-            "Prepared reveal=%s user=%s kind=%s size=%d cached=%s build_seconds=%.2f",
-            reveal["reveal_id"], interaction.user.id, reveal["kind"], size_bytes,
-            cached, time.perf_counter() - started,
+        await fail(
+            f"❌ The personalized file is too large to send here "
+            f"({size_bytes / 1048576:.1f} MB vs a {upload_limit / 1048576:.1f} MB limit)."
         )
-
-        # Send the attachment as its own ephemeral follow-up. Discord's mobile
-        # clients can fail to initialize inline video playback when a file is
-        # added by editing the deferred interaction response.
-        with discord.File(path, filename=filename, spoiler=False) as reveal_file:
-            await interaction.followup.send(
-                content=content,
-                file=reveal_file,
-                ephemeral=True,
-                wait=True,
-            )
-    except Exception:
-        log.exception(
-            "Failed to deliver reveal attachment reveal=%s user=%s",
-            reveal["reveal_id"], interaction.user.id,
-        )
-        try:
-            # Keep the mobile-friendly follow-up as the normal path. If Discord rejects
-            # that webhook upload (for example because the runtime's application webhook
-            # is unavailable), fall back to the canonical deferred response so the user
-            # still gets a private reveal rather than a dead interaction.
-            if 'path' in locals() and path.exists() and path.stat().st_size > 0 and (
-                not upload_limit or path.stat().st_size <= upload_limit
-            ):
-                with discord.File(path, filename=filename, spoiler=False) as reveal_file:
-                    await interaction.edit_original_response(
-                        content=content,
-                        attachments=[reveal_file],
-                    )
-                await asyncio.to_thread(ledger_append, reveal["reveal_id"], interaction.user.id)
-                return
-        except Exception:
-            log.exception("Canonical reveal delivery fallback failed for user=%s", interaction.user.id)
-        try:
-            await interaction.edit_original_response(
-                content="❌ I couldn't deliver your personalized reveal. Please try again.",
-                attachments=[],
-            )
-        except discord.HTTPException:
-            log.exception("Could not update failed reveal response for user=%s", interaction.user.id)
         return
 
-    try:
-        await interaction.delete_original_response()
-    except discord.HTTPException:
-        log.warning(
-            "Delivered reveal but could not remove the deferred response for user=%s",
-            interaction.user.id,
-        )
+    filename = "reveal.mp4" if reveal["kind"] == "video" else "reveal.jpg"
+    content = "🎬 Your booster reveal:" if reveal["kind"] == "video" else "🖼️ Your booster reveal:"
+
+    log.info(
+        "Prepared reveal=%s user=%s kind=%s size=%d cached=%s build_seconds=%.2f delivery=%s",
+        reveal["reveal_id"],
+        interaction.user.id,
+        reveal["kind"],
+        size_bytes,
+        cached,
+        time.perf_counter() - started,
+        "components-v2" if _components_v2_available() else "attachment",
+    )
+
+    delivered = False
+
+    # discord.py 2.6+ can expose an attachment directly through a Components V2
+    # MediaGallery. Use the same path for images and videos so mobile rendering
+    # does not depend on the legacy attachment renderer.
+    if _components_v2_available():
+        try:
+            reveal_file = discord.File(path, filename=filename, spoiler=False)
+            try:
+                # Edit the deferred original response rather than creating a follow-up.
+                # A follow-up immediately after a deferred interaction can behave as
+                # an edit of the original interaction response, so deleting the
+                # "original" afterwards can accidentally delete the video itself.
+                await interaction.edit_original_response(
+                    content=None,
+                    attachments=[reveal_file],
+                    view=_build_media_gallery_view(filename, content),
+                )
+                delivered = True
+            finally:
+                reveal_file.close()
+        except (discord.HTTPException, TypeError, AttributeError, OSError):
+            log.exception(
+                "Components V2 video delivery failed reveal=%s user=%s; falling back to attachment",
+                reveal["reveal_id"],
+                interaction.user.id,
+            )
+            delivered = False
+
+    # Legacy attachment path. This remains the compatibility fallback for older
+    # discord.py versions and any server/client/API combination that rejects V2.
+    if not delivered:
+        try:
+            reveal_file = discord.File(path, filename=filename, spoiler=False)
+            try:
+                await interaction.edit_original_response(
+                    content=content,
+                    attachments=[reveal_file],
+                    view=None,
+                )
+                delivered = True
+            finally:
+                reveal_file.close()
+        except (discord.HTTPException, OSError, TypeError):
+            log.exception(
+                "edit_original_response failed reveal=%s user=%s",
+                reveal["reveal_id"],
+                interaction.user.id,
+            )
+
+    if not delivered:
+        try:
+            reveal_file = discord.File(path, filename=filename, spoiler=False)
+            try:
+                await interaction.followup.send(
+                    content=content,
+                    file=reveal_file,
+                    ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                delivered = True
+            finally:
+                reveal_file.close()
+        except (discord.HTTPException, OSError, TypeError):
+            log.exception(
+                "followup.send failed reveal=%s user=%s",
+                reveal["reveal_id"],
+                interaction.user.id,
+            )
+
+    if not delivered:
+        await fail("❌ I couldn't deliver your personalized reveal. Please try again.")
+        return
 
     await asyncio.to_thread(ledger_append, reveal["reveal_id"], interaction.user.id)
 
@@ -551,7 +824,11 @@ class RevealButtonView(discord.ui.View):
         emoji="👁️",
         custom_id="revealbot:view-reveal:v1",
     )
-    async def view_reveal_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+    async def view_reveal_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
         del button
         await send_personalized_reveal(interaction)
 
@@ -563,7 +840,7 @@ class RevealBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self) -> None:
-        # The button has a fixed custom_id and no timeout, so it keeps working after restarts.
+        # Fixed custom_id + no timeout makes the button a persistent view across restarts.
         self.add_view(RevealButtonView())
         if GUILD_ID:
             guild = discord.Object(id=int(GUILD_ID))
@@ -574,6 +851,7 @@ class RevealBot(discord.Client):
         log.info("Synced %d command(s).", len(synced))
 
     async def on_message(self, message: discord.Message) -> None:
+        _prune_pending_uploads()
         if message.author.bot or not message.guild:
             return
         key = (message.guild.id, message.channel.id, message.author.id)
@@ -599,20 +877,29 @@ class RevealBot(discord.Client):
                 match = URL_RE.fullmatch(message.content.strip())
                 if not match:
                     await message.delete()
-                    await message.channel.send("❌ Send one direct media URL or one attached file.", delete_after=8)
+                    await message.channel.send(
+                        "❌ Send one direct media URL or one attached file.",
+                        delete_after=8,
+                    )
                     return
                 metadata = await save_new_reveal_from_url(match.group(0))
 
             try:
                 await message.delete()
             except discord.HTTPException:
-                log.warning("Could not delete the admin's upload message; grant Manage Messages to keep originals hidden.")
+                log.warning(
+                    "Could not delete the admin's upload message; grant Manage Messages to keep originals hidden."
+                )
 
             note = ""
             if metadata.get("truncated_to"):
-                note = f"\n⚠️ The source is {metadata['duration']:.0f}s; viewers receive the first {metadata['truncated_to']}s."
+                note = (
+                    f"\n⚠️ The source is {metadata['duration']:.0f}s; viewers receive "
+                    f"the first {metadata['truncated_to']}s."
+                )
             await message.channel.send(
-                f"✅ Reveal `{metadata['reveal_id']}` is live ({metadata['kind']}). Boosters can use `/view_reveal`.{note}",
+                f"✅ Reveal `{metadata['reveal_id']}` is live ({metadata['kind']}). "
+                f"Boosters can use `/view_reveal`.{note}",
                 delete_after=12,
             )
         except RevealRejected as exc:
@@ -627,7 +914,10 @@ class RevealBot(discord.Client):
                 await message.delete()
             except discord.HTTPException:
                 pass
-            await message.channel.send("❌ I couldn't ingest that media. Check the bot logs.", delete_after=10)
+            await message.channel.send(
+                "❌ I couldn't ingest that media. Check the bot logs.",
+                delete_after=10,
+            )
 
 
 bot = RevealBot()
@@ -655,10 +945,11 @@ async def on_resumed():
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.checks.has_permissions(manage_guild=True)
 async def upload(interaction: discord.Interaction):
+    _prune_pending_uploads()
     key = (interaction.guild_id or 0, interaction.channel_id or 0, interaction.user.id)
     PENDING_UPLOADS[key] = time.monotonic() + UPLOAD_WAIT_SECONDS
     await interaction.response.send_message(
-        f"Send the reveal as the next message in this channel: attach the file or paste one direct media URL. "
+        "Send the reveal as the next message in this channel: attach the file or paste one direct media URL. "
         f"I'll remove that message after ingest. This expires in {UPLOAD_WAIT_SECONDS}s.",
         ephemeral=True,
     )
@@ -685,10 +976,16 @@ async def resolve_member(guild: discord.Guild, user_id: int) -> Optional[discord
 @app_commands.checks.has_permissions(manage_guild=True)
 async def add_reveal_button(interaction: discord.Interaction, message: discord.Message):
     if not interaction.guild or not isinstance(interaction.user, discord.Member):
-        await interaction.response.send_message("This app can only be used in a server.", ephemeral=True)
+        await interaction.response.send_message(
+            "This app can only be used in a server.",
+            ephemeral=True,
+        )
         return
     if not interaction.user.guild_permissions.manage_guild:
-        await interaction.response.send_message("You need the Manage Server permission to add reveal buttons.", ephemeral=True)
+        await interaction.response.send_message(
+            "You need the Manage Server permission to add reveal buttons.",
+            ephemeral=True,
+        )
         return
     try:
         await message.reply(
@@ -697,7 +994,7 @@ async def add_reveal_button(interaction: discord.Interaction, message: discord.M
             mention_author=False,
             allowed_mentions=discord.AllowedMentions.none(),
         )
-    except discord.HTTPException as exc:
+    except discord.HTTPException:
         log.exception("Could not post reveal button reply to message %s", message.id)
         await interaction.response.send_message(
             "I couldn't reply with the reveal button. Check that I can view the channel and send messages there.",
@@ -730,12 +1027,32 @@ async def trace(
 ):
     reveals = find_reveals(reveal_id)
     if not reveals:
-        await interaction.response.send_message("I couldn't find that reveal's original file.", ephemeral=True)
+        await interaction.response.send_message(
+            "I couldn't find that reveal's original file.",
+            ephemeral=True,
+        )
+        return
+
+    for reveal in reveals:
+        _active_reveal(reveal["reveal_id"], +1)
+
+    if file.size > MAX_UPLOAD_BYTES:
+        for reveal in reveals:
+            _active_reveal(reveal["reveal_id"], -1)
+        await interaction.response.send_message(
+            f"That leak is {file.size / 1048576:.0f} MB; the limit is {MAX_UPLOAD_BYTES / 1048576:.0f} MB.",
+            ephemeral=True,
+        )
         return
 
     ok, leak_kind, ext = is_allowed_media(file.filename, file.content_type)
     if not ok:
-        await interaction.response.send_message("The leak must be an image or video.", ephemeral=True)
+        for reveal in reveals:
+            _active_reveal(reveal["reveal_id"], -1)
+        await interaction.response.send_message(
+            "The leak must be an image or video.",
+            ephemeral=True,
+        )
         return
 
     await interaction.response.defer(ephemeral=True, thinking=True)
@@ -754,9 +1071,15 @@ async def trace(
                 async with PROCESS_SEMAPHORE:
                     result = await asyncio.to_thread(
                         wm.extract,
-                        Path(reveal["path"]), leak_path, trace_kind, WM_KEY, reveal["reveal_id"],
-                        image_cell=IMAGE_CELL, video_cell=VIDEO_CELL,
-                        max_height=MAX_VIDEO_HEIGHT, start_frame=int(start_frame),
+                        Path(reveal["path"]),
+                        leak_path,
+                        trace_kind,
+                        WM_KEY,
+                        reveal["reveal_id"],
+                        image_cell=IMAGE_CELL,
+                        video_cell=VIDEO_CELL,
+                        max_height=MAX_VIDEO_HEIGHT,
+                        start_frame=int(start_frame),
                     )
             except Exception as exc:
                 log.info("Reveal %s did not decode: %s", reveal["reveal_id"], exc)
@@ -777,7 +1100,10 @@ async def trace(
             )
             log.warning(
                 "TRACE by %s: reveal=%s decoded_user=%s checked=%d",
-                interaction.user.id, reveal["reveal_id"], uid, checked,
+                interaction.user.id,
+                reveal["reveal_id"],
+                uid,
+                checked,
             )
             return
 
@@ -788,17 +1114,29 @@ async def trace(
         )
     except Exception:
         log.exception("Trace failed.")
-        await interaction.followup.send("❌ Trace failed. Check the bot logs.", ephemeral=True)
+        await interaction.followup.send(
+            "❌ Trace failed. Check the bot logs.",
+            ephemeral=True,
+        )
     finally:
         leak_path.unlink(missing_ok=True)
+        for reveal in reveals:
+            _active_reveal(reveal["reveal_id"], -1)
 
 
 @bot.tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+async def on_app_command_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError,
+):
     if isinstance(error, app_commands.MissingPermissions):
         message = "You need the **Manage Server** permission to use this command."
     else:
-        log.exception("Slash command error", exc_info=error)
+        log.error(
+            "Slash command error: %r",
+            error,
+            exc_info=(type(error), error, error.__traceback__),
+        )
         message = "Something went wrong while running that command."
     try:
         if interaction.response.is_done():
