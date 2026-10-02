@@ -28,9 +28,9 @@ VIDEO_GROUP = 8
 MATCH_H = 960                 # max dimension used for feature matching / ECC
 COARSE_H = 640                # height of frames used for the coarse video search
 COARSE_FEATURE_DIM = 1024     # max dimension for SIFT on coarse frames
-COARSE_FPS = 1.0
+COARSE_FPS = 0.75
 VIDEO_MAX_FPS = 30.0
-TRACE_MAX_SAMPLES = 12
+TRACE_MAX_SAMPLES = 8
 
 WINDOW_HALF_SEC = 1.5         # decode window around a time hint is +/- this
 WINDOW_TOP_FRAMES = 4         # reference frames (ranked by NCC) tried per window
@@ -1473,21 +1473,32 @@ def _sift_match_count(query_desc: np.ndarray | None, frame_desc: np.ndarray | No
 
 
 def _height_ladder(orig: Path, max_height: int) -> list[int]:
-    """Candidate delivery heights to try when the stored profile is unknown."""
+    """Candidate delivery heights to try when the stored profile is unknown.
+
+    Probe once at the requested ceiling instead of launching FFmpeg once per
+    ladder entry. The actual delivered height is still validated when a window
+    is decoded, while unknown-profile tracing avoids redundant probes.
+    """
+    ceiling = max(144, int(max_height))
+    try:
+        _, actual_h, _, _ = _probe_video(orig, ceiling)
+        actual_h = max(144, int(actual_h))
+    except (RuntimeError, OSError, subprocess.TimeoutExpired):
+        actual_h = ceiling
+
+    if actual_h < ceiling:
+        return [actual_h]
+
     out: list[int] = []
     seen: set[int] = set()
-    for c in (int(max_height), *HEIGHT_LADDER):
-        if c > int(max_height) or c < 144:
+    for c in (ceiling, *HEIGHT_LADDER):
+        c = int(c)
+        if c > ceiling or c < 144:
             continue
-        try:
-            _, h, _, _ = _probe_video(orig, c)
-        except (RuntimeError, OSError, subprocess.TimeoutExpired):
-            continue
-        if h in seen:
-            continue
-        seen.add(h)
-        out.append(c)
-    return out or [int(max_height)]
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out or [ceiling]
 
 
 def _coarse_rank(
@@ -1764,23 +1775,50 @@ def _sample_leak_video(
     max_height: int,
     count: int = 5,
 ) -> tuple[list[tuple[int, np.ndarray]], float]:
-    """Samples evenly spaced RGB frames from the leaked video."""
-    w, h, fps, vf = _probe_video(leak, max_height)
+    """Samples evenly spaced RGB frames without decoding the whole leak.
+
+    Random-access seeks are used because the old implementation decoded from
+    frame zero until the last requested sample. Long leaked clips therefore
+    paid almost the entire decode cost before tracing could begin.
+    """
+    w, h, fps, _ = _probe_video(leak, max_height)
     duration = _video_duration_seconds(leak)
-    count = max(1, min(int(count), 12))
-    if duration <= 0:
-        times = [0.0]
-    else:
-        times = [duration * (i + 0.5) / count for i in range(count)]
-    wanted = sorted(set(int(round(t * fps)) for t in times))
+    count = max(1, min(int(count), TRACE_MAX_SAMPLES))
+    times = [0.0] if duration <= 0 else [
+        duration * (i + 0.5) / count for i in range(count)
+    ]
+
+    vf = _scale_filter(h, "fast_bilinear")
+    frame_size = w * h * 3
     out: list[tuple[int, np.ndarray]] = []
-    max_seconds = max(1, int(np.ceil(duration))) if duration > 0 else 1
-    wanted_set = set(wanted)
-    for idx, buf in _iter_frames(leak, vf, w, h, max_seconds=max_seconds, pix_fmt="rgb24"):
-        if idx in wanted_set:
-            out.append((idx, np.frombuffer(buf, np.uint8).reshape(h, w, 3).copy()))
-            if len(out) >= len(wanted_set):
-                break
+
+    for t in times:
+        cmd = [
+            get_ffmpeg(),
+            "-hide_banner", "-loglevel", "error",
+            "-ss", f"{max(0.0, float(t)):.3f}",
+            "-i", str(leak),
+            "-an",
+            "-frames:v", "1",
+            "-vf", vf,
+            "-f", "rawvideo",
+            "-pix_fmt", "rgb24",
+            "-",
+        ]
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=min(12.0, max(3.0, WINDOW_READ_TIMEOUT / 4.0)),
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if proc.returncode != 0 or len(proc.stdout) < frame_size:
+            continue
+
+        rgb = np.frombuffer(proc.stdout[:frame_size], np.uint8).reshape(h, w, 3).copy()
+        out.append((int(round(float(t) * max(fps, 1.0))), rgb))
+
     return out, fps
 
 
