@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -33,6 +34,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--image-cell", type=int, default=int(os.getenv("WM_IMAGE_CELL", "4")))
     p.add_argument("--video-cell", type=int, default=int(os.getenv("WM_VIDEO_CELL", "8")))
     p.add_argument("--max-height", type=int, default=int(os.getenv("MAX_VIDEO_HEIGHT", "1080")))
+    p.add_argument(
+        "--delivery-height",
+        type=int,
+        default=None,
+        help="Height of the delivered video (the 'height' returned by embed_video). "
+             "Strongly recommended for video / video_frame traces.",
+    )
+    p.add_argument(
+        "--delivery-fps",
+        type=float,
+        default=None,
+        help="FPS of the delivered video (the 'fps' returned by embed_video).",
+    )
+    p.add_argument(
+        "--time-budget",
+        type=float,
+        default=float(os.getenv("TRACE_TIME_BUDGET", str(wm.DEFAULT_TIME_BUDGET))),
+        help="Max seconds to spend on a video trace",
+    )
+    p.add_argument("-v", "--verbose", action="store_true", help="Log which stage fails")
     p.add_argument("--json", action="store_true", dest="as_json", help="Print machine-readable JSON")
     return p
 
@@ -54,6 +75,12 @@ def infer_kind(original: Path, leak: Path, requested: str) -> str:
 def main() -> int:
     args = build_parser().parse_args()
 
+    logging.basicConfig(
+        level=logging.INFO if args.verbose else logging.WARNING,
+        format="%(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,  # keep stdout clean for --json
+    )
+
     secret = os.getenv("WATERMARK_SECRET")
     if not secret or len(secret) < 16:
         raise SystemExit("WATERMARK_SECRET is missing or too short.")
@@ -66,8 +93,21 @@ def main() -> int:
         raise SystemExit("--start-frame must be >= 0")
     if args.max_height < 144:
         raise SystemExit("--max-height must be >= 144")
+    if args.delivery_height is not None and args.delivery_height < 144:
+        raise SystemExit("--delivery-height must be >= 144")
+    if args.delivery_fps is not None and args.delivery_fps <= 0:
+        raise SystemExit("--delivery-fps must be > 0")
+    if args.time_budget <= 0:
+        raise SystemExit("--time-budget must be > 0")
 
     kind = infer_kind(args.original, args.leak, args.kind)
+
+    if kind in ("video", "video_frame") and args.delivery_height is None:
+        print(
+            "Warning: no --delivery-height given; trying every height in the ladder (slower, "
+            "less reliable). Pass the height/fps stored when the video was embedded.",
+            file=sys.stderr,
+        )
 
     try:
         res = wm.extract(
@@ -80,6 +120,9 @@ def main() -> int:
             video_cell=args.video_cell,
             max_height=args.max_height,
             start_frame=args.start_frame,
+            delivery_height=args.delivery_height,
+            delivery_fps=args.delivery_fps,
+            time_budget=args.time_budget,
         )
     except Exception as exc:
         if args.as_json:
