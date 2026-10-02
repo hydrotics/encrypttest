@@ -570,13 +570,6 @@ def _group_hypotheses(
     source_fps: float,
     delivery_fps: float | None = None,
 ) -> list[int]:
-    """
-    Return watermark-group hypotheses for a source frame.
-
-    New embeds use the source timeline for the chip group. Legacy embeds used
-    the delivered/output frame index. Screenshot tracing has no delivery FPS,
-    so the legacy hypotheses cover the encoder's common FPS choices.
-    """
     source_fps = max(float(source_fps), 1.0)
     source_frame_idx = max(0, int(source_frame_idx))
 
@@ -1415,7 +1408,7 @@ def _seek_frame(src: Path, time_s: float, max_height: int) -> tuple[np.ndarray, 
         "-i", str(src), "-an", "-vf", vf, "-frames:v", "1", "-f", "rawvideo",
         "-pix_fmt", "rgb24", "-",
     ]
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=12)
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3)
     expected = w * h * 3
     if proc.returncode != 0 or len(proc.stdout) < expected:
         raise RuntimeError(proc.stderr.decode("utf-8", "replace")[-1000:])
@@ -1513,30 +1506,41 @@ def _direct_decode(orig_rgb: np.ndarray, leak_rgb: np.ndarray, key: bytes, revea
     return best
 
 
-def _exact_video_frame(orig: Path, leak_rgb: np.ndarray, time_s: float, key: bytes, reveal_id: str, max_height: int, leak_fps: float | None = None) -> Optional[tuple[int, float, int, float]]:
+def _exact_video_frame(orig: Path, leak_rgb: np.ndarray, time_s: float, key: bytes, reveal_id: str, max_height: int, leak_fps: float | None = None, allow_registration: bool = True) -> Optional[tuple[int, float, int, float]]:
     height = _trace_height(orig, leak_rgb.shape[:2], max_height)
     candidates: list[tuple[np.ndarray, float, int, float]] = []
-    for offset in (0.0, -0.20, 0.20, -0.50, 0.50):
+    offsets = (0.0, -0.20, 0.20, -0.50, 0.50)
+    for offset in offsets:
         try:
             frame, fps, actual, _, _ = _seek_frame(orig, max(0.0, float(time_s) + offset), height)
         except (OSError, RuntimeError, subprocess.TimeoutExpired):
             continue
         idx = int(round(actual * fps))
         candidates.append((frame, fps, idx, actual))
+    if not candidates:
+        return None
+    groups_cache: dict[tuple[int, int], list[int]] = {}
     for frame, fps, idx, actual in candidates:
-        hit = _direct_decode(frame, leak_rgb, key, reveal_id, _group_hypotheses(idx, fps, leak_fps))
+        gkey = (int(round(fps * 1000)), int(leak_fps * 1000) if leak_fps else 0)
+        groups = groups_cache.get(gkey)
+        if groups is None:
+            groups = _group_hypotheses(idx, fps, leak_fps)
+            groups_cache[gkey] = groups
+        hit = _direct_decode(frame, leak_rgb, key, reveal_id, groups)
         if hit is not None:
             uid, metric = hit
             return uid, metric, idx, actual
-    for frame, fps, idx, actual in candidates[:3]:
+    if not allow_registration:
+        return None
+    best_reg = None
+    for frame, fps, idx, actual in candidates[:2]:
         try:
             hit = _registration_decode(frame, leak_rgb, key, reveal_id, _group_hypotheses(idx, fps, leak_fps))
         except (cv2.error, ValueError, np.linalg.LinAlgError):
             continue
-        if hit is not None:
-            uid, metric = hit
-            return uid, metric, idx, actual
-    return None
+        if hit is not None and (best_reg is None or hit[1] > best_reg[1]):
+            best_reg = (hit[0], hit[1], idx, actual)
+    return best_reg
 
 
 def extract_video_frame(orig: Path, leak: Path, key: bytes, reveal_id: str, *, cell: int = CELL, max_height: int = 1080, start_frame: int = 0) -> dict:
@@ -1573,22 +1577,156 @@ def _sample_leak_video(leak: Path, max_height: int, count: int = 5) -> tuple[lis
     return out, fps
 
 
+def _trace_video_matches(
+    orig: Path,
+    samples: list[tuple[int, np.ndarray]],
+    max_height: int,
+    top_per_sample: int = TRACE_FRAME_HINTS,
+) -> list[tuple[float, int, int]]:
+    if not samples:
+        return []
+    coarse_h = max(144, min(360, int(max_height)))
+    w, h, source_fps, _ = _probe_video(orig, coarse_h)
+    duration = min(300.0, _video_duration_seconds(orig))
+    coarse_fps = min(2.0, max(1.0, float(source_fps)))
+    vf = f"fps={coarse_fps:.6f}," + _scale_filter(coarse_h, "fast_bilinear")
+    sample_sigs = []
+    for leak_idx, sample in samples:
+        gray = sample if sample.ndim == 2 else cv2.cvtColor(sample, cv2.COLOR_RGB2GRAY)
+        sample_sigs.append((int(leak_idx), _visual_signature(gray)))
+    heaps: list[list[tuple[float, int]]] = [[] for _ in sample_sigs]
+    for idx, buf in _iter_frames(
+        orig,
+        vf,
+        w,
+        h,
+        max_seconds=max(1, int(np.ceil(duration))) if duration > 0 else 1,
+    ):
+        gray = np.frombuffer(buf, np.uint8, count=w * h).reshape(h, w)
+        sig = _visual_signature(gray)
+        for n, (_, target_sig) in enumerate(sample_sigs):
+            diff = float(np.mean(np.abs(sig - target_sig)))
+            heap = heaps[n]
+            heap.append((diff, idx))
+            if len(heap) > max(1, int(top_per_sample)) * 3:
+                heap.sort(key=lambda x: x[0])
+                del heap[max(1, int(top_per_sample)):]
+    out: list[tuple[float, int, int]] = []
+    for n, heap in enumerate(heaps):
+        heap.sort(key=lambda x: x[0])
+        leak_idx = sample_sigs[n][0]
+        for diff, source_idx in heap[:max(1, int(top_per_sample))]:
+            out.append((diff, leak_idx, source_idx))
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def _trace_decode_scan(
+    orig: Path,
+    sample_rgb: np.ndarray,
+    key: bytes,
+    reveal_id: str,
+    max_height: int,
+    leak_fps: float,
+    start_time: float = 0.0,
+    end_time: float | None = None,
+    step: float = 0.5,
+) -> Optional[tuple[int, float, int, float]]:
+    duration = _video_duration_seconds(orig)
+    if end_time is None:
+        end_time = duration
+    end_time = min(300.0, max(float(start_time), float(end_time), 0.0))
+    start_time = max(0.0, float(start_time))
+    if end_time <= start_time:
+        return None
+    source_fps = _probe_video(orig, max_height)[2]
+    t = start_time
+    while t <= end_time + 1e-6:
+        try:
+            frame, fps, actual, _, _ = _seek_frame(orig, t, max_height)
+        except (OSError, RuntimeError, subprocess.TimeoutExpired):
+            t += max(0.25, float(step))
+            continue
+        idx = int(round(actual * fps))
+        hit = _direct_decode(
+            frame,
+            sample_rgb,
+            key,
+            reveal_id,
+            _group_hypotheses(idx, fps, leak_fps),
+        )
+        if hit is not None:
+            return hit[0], hit[1], idx, actual
+        t += max(0.25, float(step))
+    return None
+
+
 def extract_video(orig: Path, leak: Path, key: bytes, reveal_id: str, *, max_height: int = 1080, start_frame: int = 0) -> dict:
-    samples, leak_fps = _sample_leak_video(leak, max_height)
+    samples, leak_fps = _sample_leak_video(leak, max_height, count=min(TRACE_MAX_SAMPLES, 8))
     if not samples:
         return _fail(frame=0, time=0.0)
     source_fps = _probe_video(orig, max_height)[2]
-    leak_duration = _video_duration_seconds(leak)
-    source_duration = min(300.0, _video_duration_seconds(orig))
-    ratio = source_duration / leak_duration if leak_duration > 0 and source_duration > 0 else 1.0
-    hints = [idx / max(leak_fps, 1.0) * ratio for idx, _ in samples]
+    sample_lookup = {idx: sample for idx, sample in samples}
+
     if start_frame > 0:
-        hints = [start_frame / max(source_fps, 1.0)]
+        hints = [(samples[0][0], max(0.0, float(start_frame) / max(source_fps, 1.0)))]
+    else:
+        source_duration = min(300.0, _video_duration_seconds(orig))
+        leak_duration = _video_duration_seconds(leak)
+        ratio = source_duration / leak_duration if leak_duration > 0 and source_duration > 0 else 1.0
+        hints = [
+            (idx, max(0.0, float(idx) / max(leak_fps, 1.0) * ratio))
+            for idx, _ in samples
+        ]
+
     best = None
-    for (hint, (_, sample)) in zip(hints, samples):
-        hit = _exact_video_frame(orig, cv2.cvtColor(sample, cv2.COLOR_GRAY2RGB), hint, key, reveal_id, max_height, leak_fps)
+    tried: set[tuple[int, int]] = set()
+    for leak_idx, hint in hints:
+        sample = sample_lookup[leak_idx]
+        leak_rgb = cv2.cvtColor(sample, cv2.COLOR_GRAY2RGB)
+        hit = _exact_video_frame(orig, leak_rgb, hint, key, reveal_id, max_height, leak_fps, False)
         if hit is not None and (best is None or hit[1] > best[1]):
             best = hit
+        if best is not None and best[1] >= 7.0:
+            break
+
+    if best is None and start_frame == 0:
+        for leak_idx, source_idx in _trace_video_matches(orig, samples, max_height)[:TRACE_FRAME_HINTS]:
+            pair = (int(leak_idx), int(source_idx))
+            if pair in tried:
+                continue
+            tried.add(pair)
+            sample = sample_lookup[leak_idx]
+            hint = float(source_idx) / max(source_fps, 1.0)
+            hit = _exact_video_frame(
+                orig,
+                cv2.cvtColor(sample, cv2.COLOR_GRAY2RGB),
+                hint,
+                key,
+                reveal_id,
+                max_height,
+                leak_fps,
+            )
+            if hit is not None and (best is None or hit[1] > best[1]):
+                best = hit
+            if best is not None and best[1] >= 7.0:
+                break
+
+    if best is None and start_frame == 0:
+        sample = cv2.cvtColor(samples[0][1], cv2.COLOR_GRAY2RGB)
+        scan_end = min(60.0, _video_duration_seconds(orig))
+        best = _trace_decode_scan(
+            orig,
+            sample,
+            key,
+            reveal_id,
+            max_height,
+            leak_fps,
+            0.0,
+            scan_end,
+            0.5,
+        )
+
     if best is None:
         return _fail(frame=0, time=0.0)
     uid, metric, frame, actual = best
