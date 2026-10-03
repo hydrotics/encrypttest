@@ -11,44 +11,74 @@ import subprocess
 import tempfile
 import time
 import zlib
+from contextlib import closing
 from functools import lru_cache
 from pathlib import Path
 from typing import Iterator, Optional
 
-import cv2
-import imageio_ffmpeg
-import numpy as np
-from PIL import Image, ImageOps
+                                                                               
+                                                                           
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
+import cv2              
+import imageio_ffmpeg              
+import numpy as np              
+from PIL import Image              
 
 log = logging.getLogger(__name__)
+
+                                                                             
+           
+                                                                             
 
 N_BITS = 96
 CELL = 16
 AMP = 4.0
 VIDEO_GROUP = 8
-MATCH_H = 960                 # max dimension used for feature matching / ECC
-COARSE_H = 640                # height of frames used for the coarse video search
-COARSE_FEATURE_DIM = 1024     # max dimension for SIFT on coarse frames
-COARSE_FPS = 0.75
+MATCH_H = 960                                                                
+COARSE_H = 640                                                                   
+COARSE_FEATURE_DIM = 1024                                              
+COARSE_FPS = 0.50
 VIDEO_MAX_FPS = 30.0
-TRACE_MAX_SAMPLES = 8
+TRACE_MAX_SAMPLES = 4
 
-WINDOW_HALF_SEC = 1.5         # decode window around a time hint is +/- this
-WINDOW_TOP_FRAMES = 4         # reference frames (ranked by NCC) tried per window
+WINDOW_HALF_SEC = 1.5                                                       
+WINDOW_TOP_FRAMES = 6                                                            
 WINDOW_READ_TIMEOUT = 60.0
-DEFAULT_TIME_BUDGET = 180.0   # seconds of wall-clock for one video extraction
+DEFAULT_TIME_BUDGET = 90.0                                                   
 ECC_MIN_CC = 0.5
 
-# Image tracing is deliberately memory-bounded. Never retain several full-resolution
-# warped RGB copies at once: a 4K image can turn each copy into hundreds of MB.
-TRACE_IMAGE_MAX_FEATURES = 1400
+                                                                
+CV_THREADS = max(1, int(os.getenv("CV_THREADS", "1")))
+FFMPEG_THREADS = max(1, int(os.getenv("FFMPEG_THREADS", "1")))
+cv2.setNumThreads(CV_THREADS)
+
+                                                                                    
+                        
+TRACE_IMAGE_MAX_FEATURES = 1100
 TRACE_IMAGE_MAX_CANDIDATES = 2
 TRACE_IMAGE_ECC = True
 TRACE_IMAGE_TRANSLATION_RADIUS = 2
+TRACE_IMAGE_DENSE_SHIFTS = False                                                                      
 TRACE_IMAGE_MAX_PIXELS = int(float(os.getenv("TRACE_IMAGE_MAX_MEGAPIXELS", "18")) * 1_000_000)
+EMBED_IMAGE_MAX_PIXELS = int(float(os.getenv("EMBED_IMAGE_MAX_MEGAPIXELS", "40")) * 1_000_000)
+EMBED_BAND_ROWS = 512                                          
+assert EMBED_BAND_ROWS % CELL == 0
 
-VIDEO_FPS_HYPOTHESES = (30.0, 27.0, 24.0, 20.0, 18.0, 15.0, 12.0)
+VIDEO_FPS_HYPOTHESES = (30.0, 29.97, 27.0, 25.0, 24.0, 23.976, 20.0, 18.0, 15.0, 12.0)
 HEIGHT_LADDER = (1080, 900, 720, 648, 576, 540, 480, 360)
+
+MIN_VIDEO_BPS = 128_000
+USE_VBV_CAP = True                                                                              
+
+                                                                          
+                                                                         
+FFMPEG_FORMAT_WHITELIST = os.getenv(
+    "FFMPEG_FORMAT_WHITELIST",
+    "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi,m4v",
+)
 
 _x, _y = np.mgrid[:CELL, :CELL].astype(np.float32)
 _CARRIER = (
@@ -56,30 +86,47 @@ _CARRIER = (
     + .8 * np.cos(np.pi * 2 * (_y + .5) / CELL) * np.cos(np.pi * (_x + .5) / CELL)
 ).astype(np.float32)
 _CARRIER /= np.sqrt(np.mean(_CARRIER * _CARRIER)) + 1e-8
-RGB2Y = np.array([0.299, 0.587, 0.114], np.float32)
+_CARRIER_SQ = (_CARRIER * _CARRIER).astype(np.float32)
+_CARRIER_SQ_SUM = np.float32(_CARRIER_SQ.sum())
 
-MAX_BITS_PER_PIXEL = 0.11
-MIN_VIDEO_BPS = 128_000
-CONTAINER_MARGIN = 0.975
+_ORIENT = {
+    2: Image.Transpose.FLIP_LEFT_RIGHT,
+    3: Image.Transpose.ROTATE_180,
+    4: Image.Transpose.FLIP_TOP_BOTTOM,
+    5: Image.Transpose.TRANSPOSE,
+    6: Image.Transpose.ROTATE_270,
+    7: Image.Transpose.TRANSVERSE,
+    8: Image.Transpose.ROTATE_90,
+}
 
 
+@lru_cache(maxsize=1)
 def get_ffmpeg() -> str:
-    getter = getattr(imageio_ffmpeg, "get_ffmpeg_exe", None)
-    if getter is None:
-        getter = getattr(imageio_ffmpeg, "get_exe", None)
-    if getter is None:
-        raise RuntimeError(
-            "This imageio-ffmpeg installation does not expose an FFmpeg executable getter."
-        )
-    exe = getter()
+    exe = imageio_ffmpeg.get_ffmpeg_exe()
     if not exe:
         raise RuntimeError("No usable FFmpeg executable was found.")
     return str(exe)
 
 
-# ---------------------------------------------------------------------------
-# Payload
-# ---------------------------------------------------------------------------
+def _ff() -> list[str]:
+    return [get_ffmpeg(), "-hide_banner", "-loglevel", "error"]
+
+
+def _in(path) -> list[str]:
+    """Input options for an untrusted media file (threads, protocol + demuxer limits)."""
+    opts = ["-threads", str(FFMPEG_THREADS), "-protocol_whitelist", "file,pipe"]
+    if FFMPEG_FORMAT_WHITELIST:
+        opts += ["-format_whitelist", FFMPEG_FORMAT_WHITELIST]
+    return [*opts, "-i", str(path)]
+
+
+def _fail(**extra) -> dict:
+    return {"user_id": 0, "metric": 0.0, "ok": False, "valid": False, **extra}
+
+
+                                                                             
+         
+                                                                             
 
 def encode_payload(user_id: int) -> np.ndarray:
     uid = int(user_id) & ((1 << 64) - 1)
@@ -91,51 +138,52 @@ def encode_payload(user_id: int) -> np.ndarray:
     ) * 2.0 - 1.0
 
 
+def _crc_ok(v: int) -> bool:
+    return zlib.crc32((v >> 32).to_bytes(8, "big")) == (v & 0xFFFFFFFF)
+
+
 def decode_payload(scores: np.ndarray) -> tuple[int, bool]:
-    bits = (np.asarray(scores) > 0).astype(np.uint8)
-    value = 0
-    for bit in bits:
-        value = (value << 1) | int(bit)
-    uid = value >> 32
-    if zlib.crc32(uid.to_bytes(8, "big")) == (value & 0xFFFFFFFF):
-        return uid, True
+    """Hard-decide the bits, then try flipping the 1-3 least confident of the 12 weakest."""
+    s = np.asarray(scores)
+    value = int.from_bytes(np.packbits((s > 0).astype(np.uint8)).tobytes(), "big")           
+    if _crc_ok(value):
+        return value >> 32, True
 
-    weak = np.argsort(np.abs(np.asarray(scores)))[:12]
-    if len(weak) < 2:
-        return uid, False
-
+    masks = [1 << (N_BITS - 1 - int(i)) for i in np.argsort(np.abs(s))[:12]]
     for flips in (1, 2, 3):
-        for idxs in itertools.combinations(weak.tolist(), flips):
-            test = bits.copy()
-            test[list(idxs)] ^= 1
-            value = 0
-            for bit in test:
-                value = (value << 1) | int(bit)
-            uid = value >> 32
-            if zlib.crc32(uid.to_bytes(8, "big")) == (value & 0xFFFFFFFF):
-                return uid, True
-    return uid, False
+        for combo in itertools.combinations(masks, flips):
+            t = value
+            for m in combo:
+                t ^= m
+            if _crc_ok(t):
+                return t >> 32, True
+    return value >> 32, False
 
 
-# ---------------------------------------------------------------------------
-# Embedding / scoring primitives
-# ---------------------------------------------------------------------------
+                                                                             
+                                
+                                                                             
 
 def _seed(key: bytes, *parts) -> int:
     message = ":".join(map(str, parts)).encode()
     return int.from_bytes(hmac.new(key, message, hashlib.sha256).digest()[:16], "big")
 
 
-@lru_cache(maxsize=32)
+@lru_cache(maxsize=16)
 def _layout(key: bytes, reveal_id: str, h: int, w: int) -> np.ndarray:
     ch, cw = -(-h // CELL), -(-w // CELL)
     rng = np.random.default_rng(_seed(key, reveal_id, "layout", ch, cw))
-    return (rng.permutation(ch * cw).reshape(ch, cw) % N_BITS).astype(np.int16)
+    out = (rng.permutation(ch * cw).reshape(ch, cw) % N_BITS).astype(np.int16)
+    out.setflags(write=False)
+    return out
 
 
+@lru_cache(maxsize=32)
 def _chips(key: bytes, reveal_id: str, group: int, ch: int, cw: int) -> np.ndarray:
     rng = np.random.default_rng(_seed(key, reveal_id, "chips", group))
-    return rng.choice(np.array([-1, 1], np.float32), (ch, cw))
+    out = rng.choice(np.array([-1, 1], np.int8), (ch, cw))                                         
+    out.setflags(write=False)
+    return out
 
 
 def _grid(h: int, w: int) -> tuple[int, int]:
@@ -173,26 +221,48 @@ def _delta(
     return d.transpose(0, 2, 1, 3).reshape(ch * CELL, cw * CELL)[:h, :w]
 
 
-def _tone_match(orig: np.ndarray, leak: np.ndarray, valid: np.ndarray) -> np.ndarray:
-    m = valid > 0.35
-    if int(m.sum()) < 500:
+def _tone_match(
+    orig: np.ndarray,
+    leak: np.ndarray,
+    valid: np.ndarray | None,
+    max_samples: int = 300_000,
+) -> np.ndarray:
+    """Gain/offset fit of leak -> orig on a sparse, odd-strided sample of valid pixels.
+    The stride is odd so it never locks onto the 16 px carrier period."""
+    if valid is None:
+        n = int(orig.size)
+        m = None
+    else:
+        m = valid > 0.35
+        n = int(np.count_nonzero(m))
+    if n < 500:
         return leak
 
-    x = orig[m].astype(np.float64)
-    y = leak[m].astype(np.float64)
+    step = max(1, int((n / max_samples) ** 0.5)) | 1
+    if m is None:
+        x = orig[::step, ::step].ravel().astype(np.float64)
+        y = leak[::step, ::step].ravel().astype(np.float64)
+    else:
+        mm = m[::step, ::step]
+        x = orig[::step, ::step][mm].astype(np.float64)
+        y = leak[::step, ::step][mm].astype(np.float64)
+    del m
 
     lo_x, hi_x = np.percentile(x, [2, 98])
     lo_y, hi_y = np.percentile(y, [2, 98])
     keep = (x >= lo_x) & (x <= hi_x) & (y >= lo_y) & (y <= hi_y)
     x, y = x[keep], y[keep]
 
-    if x.size < 500 or np.var(x) < 1e-3:
+    if x.size < 500 or x.var() < 1e-3:
         return leak
 
-    a = float(np.cov(x, y, bias=True)[0, 1] / max(np.var(y), 1e-6))
+    a = float(((x - x.mean()) * (y - y.mean())).mean() / max(y.var(), 1e-6))
     b = float(x.mean() - a * y.mean())
     a = float(np.clip(a, 0.65, 1.6))
-    return (a * leak.astype(np.float32) + b).astype(np.float32)
+    out = leak.astype(np.float32)                                                           
+    out *= a
+    out += b
+    return out
 
 
 def _score(
@@ -203,35 +273,55 @@ def _score(
     group: int,
     valid: np.ndarray | None = None,
 ) -> np.ndarray:
+    """Per-bit correlation scores. `valid=None` means "every pixel valid" and takes a
+    cheaper path that never allocates a full-size mask."""
     h, w = orig.shape
     ch, cw = _grid(h, w)
-    if valid is None:
-        valid = np.ones_like(orig, np.float32)
-    valid = np.clip(valid.astype(np.float32), 0, 1)
+    H, W = ch * CELL, cw * CELL
+
     leak = _tone_match(orig, leak, valid)
-    p = _pad(leak - orig.astype(np.float32), ch * CELL, cw * CELL)
-    vm = _pad(valid, ch * CELL, cw * CELL)
-    b = p.reshape(ch, CELL, cw, CELL).transpose(0, 2, 1, 3)
-    vb = vm.reshape(ch, CELL, cw, CELL).transpose(0, 2, 1, 3)
-    weight = vb.sum((2, 3))
-    b -= (b * vb).sum((2, 3), keepdims=True) / np.maximum(weight[:, :, None, None], 1e-5)
+    p = _pad(np.subtract(leak, orig, dtype=np.float32), H, W)                                    
+    b = p.reshape(ch, CELL, cw, CELL).transpose(0, 2, 1, 3)                
+
+    if valid is None:
+        vb = None
+        b -= b.mean((2, 3), keepdims=True)
+    else:
+        vm = _pad(valid if valid.dtype == np.float32 else valid.astype(np.float32), H, W)
+        vb = vm.reshape(ch, CELL, cw, CELL).transpose(0, 2, 1, 3)
+        weight = vb.sum((2, 3))
+        mean = np.einsum("abij,abij->ab", b, vb) / np.maximum(weight, 1e-5)
+        b -= mean[:, :, None, None]
+
+                                                                                       
+                                                                                            
     smooth = cv2.GaussianBlur(
         b.reshape(ch * cw, CELL, CELL),
         (0, 0),
         1.15,
     ).reshape(ch, cw, CELL, CELL)
-    b -= 0.30 * smooth
-    carrier = _CARRIER[None, None]
-    corr = (b * carrier * vb).sum((2, 3))
-    den = np.sqrt(
-        (vb * (carrier ** 2)).sum((2, 3))
-        * (vb * (b ** 2)).sum((2, 3))
-        + 1e-5
-    )
-    corr /= np.maximum(den, 1e-4)
-    coverage = np.clip(vb.mean((2, 3)), 0, 1)
-    vals = corr * _chips(key, reveal_id, group, ch, cw) * coverage
-    vals[coverage < 0.25] = 0.0
+    smooth *= 0.30
+    b -= smooth
+    del smooth
+
+    chips = _chips(key, reveal_id, group, ch, cw)
+    if vb is None:
+        corr = np.einsum("abij,ij->ab", b, _CARRIER)
+        den = np.sqrt(_CARRIER_SQ_SUM * np.einsum("abij,abij->ab", b, b) + 1e-5)
+        corr /= np.maximum(den, 1e-4)
+        vals = corr * chips
+    else:
+        corr = np.einsum("abij,ij,abij->ab", b, _CARRIER, vb)
+        den = np.sqrt(
+            np.einsum("abij,ij->ab", vb, _CARRIER_SQ)
+            * np.einsum("abij,abij,abij->ab", vb, b, b)
+            + 1e-5
+        )
+        corr /= np.maximum(den, 1e-4)
+        coverage = np.clip(vb.mean((2, 3)), 0, 1)
+        vals = corr * chips * coverage
+        vals[coverage < 0.25] = 0.0
+
     return np.bincount(
         _layout(key, reveal_id, h, w).ravel(),
         vals.ravel(),
@@ -239,14 +329,30 @@ def _score(
     )
 
 
-def _load_rgb(path: Path) -> Image.Image:
+def _open_oriented(path: Path, mode: str, max_pixels: int) -> Image.Image:
+    """Open, size-check from the header (before decoding), convert, then apply EXIF
+    orientation. Rotating after conversion keeps the peak at one decoded copy."""
     with Image.open(path) as im:
-        return ImageOps.exif_transpose(im).convert("RGB")
+        px = int(im.width) * int(im.height)
+        if px > max_pixels:
+            raise RuntimeError(
+                f"Image is too large ({px / 1e6:.1f} MP; limit {max_pixels / 1e6:.1f} MP)."
+            )
+        orient = im.getexif().get(0x0112, 1)
+        out = im.convert(mode)
+    op = _ORIENT.get(orient)
+    if op is not None:
+        out = out.transpose(op)
+    return out
 
 
-# ---------------------------------------------------------------------------
-# Registration (screenshot / crop / resize recovery)
-# ---------------------------------------------------------------------------
+def _load_rgb(path: Path, max_pixels: int = EMBED_IMAGE_MAX_PIXELS) -> Image.Image:
+    return _open_oriented(path, "RGB", max_pixels)
+
+
+                                                                             
+                                                    
+                                                                             
 
 def _to_gray(a: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(a, cv2.COLOR_RGB2GRAY) if a.ndim == 3 else a
@@ -298,6 +404,18 @@ def _homography_is_reasonable(
     return 0.005 <= ratio <= 4.0 and np.max(np.abs(q)) < 10.0 * max(dst_w, dst_h)
 
 
+def _corner_gap(a: np.ndarray, b: np.ndarray, shape: tuple[int, int]) -> float:
+    """Max corner displacement (px) between two leak->orig maps; used to drop duplicates."""
+    sh, sw = shape
+    pts = np.float32([[0, 0], [sw - 1, 0], [sw - 1, sh - 1], [0, sh - 1]]).reshape(-1, 1, 2)
+    try:
+        qa = cv2.perspectiveTransform(pts, a)
+        qb = cv2.perspectiveTransform(pts, b)
+    except cv2.error:
+        return float("inf")
+    return float(np.max(np.abs(qa - qb)))
+
+
 def _estimate_scale(mat3: np.ndarray, src_shape: tuple[int, int]) -> float:
     """Approximate linear scale of the map leak -> orig (<1 means the leak is being shrunk)."""
     sh, sw = src_shape
@@ -337,11 +455,22 @@ def _warp_candidate(
     return warped, valid
 
 
+def _clean_valid(valid: np.ndarray | None) -> np.ndarray | None:
+    """Soften mask edges; return None when the mask is all ones (cheaper scoring path)."""
+    if valid is None:
+        return None
+    if not np.any(valid < 0.99):
+        return None
+    valid = cv2.GaussianBlur(valid.astype(np.float32), (0, 0), 0.8)
+    valid[valid < 0.12] = 0.0
+    return valid
+
+
 def _estimate_affine(
     src_pts: np.ndarray,
     dst_pts: np.ndarray,
     partial: bool,
-) -> Optional[np.ndarray]:
+) -> Optional[tuple[np.ndarray, int]]:
     fn = cv2.estimateAffinePartial2D if partial else cv2.estimateAffine2D
     mat, mask = fn(
         src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=3.0,
@@ -349,7 +478,7 @@ def _estimate_affine(
     )
     if mat is None or mask is None or int(mask.sum()) < 6:
         return None
-    return np.vstack([mat, [0.0, 0.0, 1.0]]).astype(np.float64)
+    return np.vstack([mat, [0.0, 0.0, 1.0]]).astype(np.float64), int(mask.sum())
 
 
 def _ecc_refine(
@@ -376,6 +505,7 @@ def _ecc_refine(
         template = cv2.GaussianBlur(og.astype(np.float32) / 255.0, (0, 0), 1.0)
         moving = cv2.GaussianBlur(wg.astype(np.float32) / 255.0, (0, 0), 1.0)
         mask = (vs > 0.9).astype(np.uint8)
+        del og, wg, vs
         if int(mask.sum()) < 100:
             return warped_rgb, valid
 
@@ -388,7 +518,7 @@ def _ecc_refine(
         if not np.isfinite(cc) or cc < ECC_MIN_CC:
             return warped_rgb, valid
 
-        # S^-1 A S : convert the reduced-resolution matrix to full resolution
+                                                                             
         matrix[0, 1] *= sy / sx
         matrix[1, 0] *= sx / sy
         matrix[0, 2] /= sx
@@ -421,14 +551,10 @@ def _registration_matrices(
     *,
     max_candidates: int = TRACE_IMAGE_MAX_CANDIDATES,
 ) -> list[np.ndarray]:
-    """Return a tiny set of promising leak->original registration matrices.
-
-    The old implementation immediately warped the entire leak into full
-    resolution for every SIFT/ORB hypothesis and retained those arrays in a
-    list. On large images that made peak RSS grow roughly with the number of
-    registration candidates. This function keeps only compact 3x3 matrices;
-    full-resolution warps are created one at a time by ``extract_image``.
-    """
+    """Return a tiny set of promising leak->original registration matrices (full-res
+    coordinates). Only compact 3x3 matrices are retained; callers materialise one
+    full-resolution warp at a time."""
+    cap = max(1, int(max_candidates))
     o_g, o_sc = _feature_image(orig)
     l_g, l_sc = _feature_image(leak)
     o_shape = orig.shape[:2]
@@ -436,17 +562,20 @@ def _registration_matrices(
     found: list[tuple[int, np.ndarray]] = []
 
     def to_full(hmat: np.ndarray) -> np.ndarray:
+        """reduced-leak -> reduced-orig  ==>  full-leak -> full-orig"""
         return (
             np.diag([1.0 / max(o_sc, 1e-8), 1.0 / max(o_sc, 1e-8), 1.0])
             @ hmat
             @ np.diag([max(l_sc, 1e-8), max(l_sc, 1e-8), 1.0])
         ).astype(np.float64)
 
-    def add_mat(mat3: np.ndarray, inliers: int) -> None:
-        if len(found) >= max(1, int(max_candidates)):
+    def add_mat(full: np.ndarray, inliers: int) -> None:
+        if len(found) >= cap:
             return
-        full = mat3 if mat3.shape == (3, 3) else np.asarray(mat3, np.float64)
         if not _homography_is_reasonable(full, l_shape, o_shape):
+            return
+                                                                                   
+        if any(_corner_gap(full, m, l_shape) < 2.0 for _, m in found):
             return
         found.append((int(inliers), full))
 
@@ -465,10 +594,10 @@ def _registration_matrices(
                 if len(m) == 2 and m[0].distance < 0.80 * m[1].distance
             ]
             if len(good) >= 6:
-                src = np.float32([lkp[m.queryIdx].pt for m in good])
-                dst = np.float32([okp[m.trainIdx].pt for m in good])
+                src = np.float32([lkp[m.queryIdx].pt for m in good])                   
+                dst = np.float32([okp[m.trainIdx].pt for m in good])                   
 
-                # Prefer a homography for crop/rotation/perspective edits.
+                                                                          
                 try:
                     hmat, mask = cv2.findHomography(
                         src, dst, cv2.RANSAC, 3.0, maxIters=2500, confidence=0.99,
@@ -480,21 +609,13 @@ def _registration_matrices(
                 except cv2.error:
                     pass
 
-                # Partial affine is useful for ordinary crop/resize/rotation and
-                # is kept as a fallback when the homography is weak.
-                if len(found) < max(1, int(max_candidates)):
+                                                                                 
+                                                                                       
+                if len(found) < cap:
                     try:
-                        mat = _estimate_affine(
-                            src / max(l_sc, 1e-8),
-                            dst / max(o_sc, 1e-8),
-                            True,
-                        )
-                        if mat is not None:
-                            # The affine returned above lives in reduced-feature
-                            # coordinates, so map it back to full image pixels.
-                            full = to_full(mat)
-                            if _homography_is_reasonable(full, l_shape, o_shape):
-                                add_mat(full, len(good))
+                        res = _estimate_affine(src, dst, True)
+                        if res is not None:
+                            add_mat(to_full(res[0]), res[1])
                     except cv2.error:
                         pass
     except cv2.error as exc:
@@ -525,55 +646,54 @@ def _registration_matrices(
             log.debug("ORB registration failed: %s", exc)
 
     found.sort(key=lambda item: item[0], reverse=True)
-    return [mat for _, mat in found[: max(1, int(max_candidates))]]
+    return [mat for _, mat in found[:cap]]
 
 
-def _registration_candidates(
+def _aspect_close(a_shape: tuple[int, int], b_shape: tuple[int, int], tol: float = 0.01) -> bool:
+    ra = a_shape[1] / max(a_shape[0], 1)
+    rb = b_shape[1] / max(b_shape[0], 1)
+    return abs(ra / max(rb, 1e-9) - 1.0) <= tol
+
+
+def _iter_registration_candidates(
     orig: np.ndarray,
     leak: np.ndarray,
     *,
     refine_ecc: bool = True,
-) -> list[tuple[np.ndarray, np.ndarray]]:
-    """Compatibility wrapper; large callers should prefer _registration_matrices."""
+) -> Iterator[tuple[np.ndarray, Optional[np.ndarray]]]:
+    """Lazily yield (aligned_leak, valid) pairs, one at a time, so only one full-size
+    candidate is alive at once. `valid` is None when every pixel is valid.
+    Every matrix gets its warped AND ECC-refined candidate (the old shared cap of 3
+    meant a second matrix was rarely tried)."""
     o_shape = orig.shape[:2]
-    candidates: list[tuple[np.ndarray, np.ndarray]] = [
-        (leak, np.ones(leak.shape[:2], np.float32))
-    ]
+    if leak.shape[:2] == o_shape:
+        yield leak, None
+
     for mat3 in _registration_matrices(orig, leak):
         warped, valid = _warp_candidate(leak, mat3, o_shape)
-        candidates.append((warped, valid))
+        refined = rvalid = None
         if refine_ecc:
-            refined, refined_valid = _ecc_refine(orig, warped, valid)
-            if refined is not warped:
-                candidates.append((refined, refined_valid))
-        if len(candidates) >= TRACE_IMAGE_MAX_CANDIDATES + 1:
-            break
+            refined, rvalid = _ecc_refine(orig, warped, valid)
+        yield warped, _clean_valid(valid)
+        if refined is not None and refined is not warped:
+            yield refined, _clean_valid(rvalid)
+        del warped, valid, refined, rvalid
 
-    if orig.shape[:2] != leak.shape[:2] and len(candidates) < TRACE_IMAGE_MAX_CANDIDATES + 1:
-        resized = cv2.resize(leak, (orig.shape[1], orig.shape[0]), interpolation=cv2.INTER_AREA)
-        candidates.append((resized, np.ones(orig.shape[:2], np.float32)))
+    if leak.shape[:2] != o_shape and _aspect_close(leak.shape[:2], o_shape):
+        yield cv2.resize(leak, (o_shape[1], o_shape[0]), interpolation=cv2.INTER_AREA), None
 
-    cleaned = []
-    for cand, valid in candidates[: TRACE_IMAGE_MAX_CANDIDATES + 1]:
-        if valid is not None and np.any(valid < 0.99):
-            valid = cv2.GaussianBlur(valid.astype(np.float32), (0, 0), 0.8)
-            valid[valid < 0.12] = 0.0
-        cleaned.append((cand, valid))
-    return cleaned
 
 def _image_trace_variants(h: int, w: int) -> list[tuple[float, float, float, float, float]]:
-    """Small residual-registration search used after feature registration.
-
-    SIFT/ORB already recover crop/scale/rotation. Re-searching every scale and
-    rotation at full resolution is expensive, so the image trace path only
-    checks a 3x3 translation neighborhood for residual alignment.
-    """
+    """Small residual-registration search used after feature registration: a translation
+    neighbourhood only (SIFT/ORB/ECC already recovered scale and rotation)."""
     radius = max(1, int(TRACE_IMAGE_TRANSLATION_RADIUS))
+    offsets = range(-radius, radius + 1) if TRACE_IMAGE_DENSE_SHIFTS else (-radius, 0, radius)
     return [
         (0.0, 0.0, 0.0, dx / max(w, 1), dy / max(h, 1))
-        for dy in (-radius, 0, radius)
-        for dx in (-radius, 0, radius)
+        for dy in offsets
+        for dx in offsets
     ]
+
 
 def _geometry_variants(
     h: int,
@@ -605,6 +725,10 @@ def _warp_y(
     translate_x: float = 0.0,
     translate_y: float = 0.0,
 ) -> np.ndarray:
+                                                                      
+    if not (scale_x or scale_y or rotation or translate_x or translate_y):
+        return y
+
     h, w = y.shape
 
     cx = (w - 1) * 0.5
@@ -644,12 +768,6 @@ def _warp_y(
     )
 
 
-def _unpack_variant(v) -> tuple[float, float, float, float, float]:
-    if len(v) == 2:
-        return float(v[0]), float(v[1]), 0.0, 0.0, 0.0
-    return tuple(float(x) for x in v)  # type: ignore[return-value]
-
-
 def _top_scores(
     oy: np.ndarray,
     leak_y: np.ndarray,
@@ -663,10 +781,10 @@ def _top_scores(
     """Scores every geometry variant, then re-scores the best `keep` with a light blur.
     Returns (metric, scores) pairs sorted best first. Decoding is left to the caller so the
     expensive error-correction search only runs on promising candidates."""
-    valid_f = valid.astype(np.float32) if valid is not None else None
+    valid_f = valid.astype(np.float32, copy=False) if valid is not None else None
     plain: list[tuple[float, np.ndarray, tuple]] = []
     for v in variants:
-        p = _unpack_variant(v)
+        p = tuple(float(x) for x in v)
         warped = _warp_y(leak_y, *p)
         wv = _warp_y(valid_f, *p) if valid_f is not None else None
         s = _score(oy, warped, key, reveal_id, group, valid=wv)
@@ -705,22 +823,31 @@ def _group_hypotheses(
     source_fps: float,
     delivery_fps: float | None = None,
 ) -> list[int]:
+    """Return a small phase-tolerant set of watermark groups.
+
+    The encoder's fps filter is timestamp based, so a source-frame -> delivery-frame
+    conversion can land one frame either side of the ideal rounded index. The old
+    implementation only covered +/- one group around a single rounded conversion.
+    A group boundary is exactly where that assumption fails. Keep the search cheap,
+    but cover floor/round/ceil plus +/-2 groups around each estimate.
+    """
     source_fps = max(float(source_fps), 1.0)
     source_frame_idx = max(0, int(source_frame_idx))
 
     ordered: list[int] = []
     seen: set[int] = set()
 
-    def add_group(center: int) -> None:
+    def add_group(center: int, radius: int = 2) -> None:
         center = max(0, int(center))
-        for delta in (0, -1, 1):
+        for delta in range(-radius, radius + 1):
             value = center + delta
             if value < 0 or value in seen:
                 continue
             seen.add(value)
             ordered.append(value)
 
-    add_group(source_frame_idx // VIDEO_GROUP)
+                                                           
+    add_group(source_frame_idx // VIDEO_GROUP, radius=1)
 
     if delivery_fps is not None:
         fps_values = [float(delivery_fps)]
@@ -736,17 +863,16 @@ def _group_hypotheses(
             unique_fps.append(fps)
 
     for fps in unique_fps:
-        delivered_frame_idx = int(
-            round(source_frame_idx * fps / source_fps)
-        )
-        add_group(delivered_frame_idx // VIDEO_GROUP)
+        ratio = source_frame_idx * fps / source_fps
+        for delivered_frame_idx in {int(ratio // 1), int(round(ratio)), int(np.ceil(ratio))}:
+            add_group(delivered_frame_idx // VIDEO_GROUP)
 
     return ordered
 
 
-# ---------------------------------------------------------------------------
-# Images
-# ---------------------------------------------------------------------------
+                                                                             
+        
+                                                                             
 
 def embed_image_array(
     rgb: np.ndarray,
@@ -754,18 +880,32 @@ def embed_image_array(
     key: bytes,
     reveal_id: str,
     amp: float = AMP,
+    *,
+    inplace: bool = False,
+    band_rows: int = EMBED_BAND_ROWS,
 ) -> np.ndarray:
+    """Embed the watermark band by band (cell-aligned, so the result equals the
+    whole-image computation). With inplace=True the input array is overwritten and
+    no second full-size buffer is allocated."""
+    band_rows = max(CELL, (int(band_rows) // CELL) * CELL)
     h, w, _ = rgb.shape
-    ycc = cv2.cvtColor(rgb, cv2.COLOR_RGB2YCrCb)
-    y = ycc[:, :, 0].astype(np.float32)
-    d = _delta(y, encode_payload(user_id), key, reveal_id, 0, amp)
-
-    y2 = np.clip(y + d, 0, 255).astype(np.uint8)
-
-    out = cv2.cvtColor(
-        cv2.merge((y2, ycc[:, :, 1], ycc[:, :, 2])),
-        cv2.COLOR_YCrCb2RGB,
+    ch, cw = _grid(h, w)
+    cell_bits = (
+        encode_payload(user_id)[_layout(key, reveal_id, h, w)]
+        * _chips(key, reveal_id, 0, ch, cw)
     )
+    out = rgb if inplace else rgb.copy()
+
+    for r0 in range(0, h, band_rows):
+        r1 = min(h, r0 + band_rows)
+        c0, c1 = r0 // CELL, -(-r1 // CELL)
+        ycc = cv2.cvtColor(out[r0:r1], cv2.COLOR_RGB2YCrCb)
+        y = ycc[:, :, 0].astype(np.float32)
+        cells = cell_bits[c0:c1] * _texture(y)
+        d = cells[:, :, None, None] * _CARRIER[None, None] * float(amp)
+        d = d.transpose(0, 2, 1, 3).reshape((c1 - c0) * CELL, cw * CELL)[: r1 - r0, :w]
+        ycc[:, :, 0] = np.clip(y + d, 0, 255).astype(np.uint8)
+        out[r0:r1] = cv2.cvtColor(ycc, cv2.COLOR_YCrCb2RGB)
     return out
 
 
@@ -780,6 +920,12 @@ def _save_image(img: Image.Image, dst: Path) -> None:
         img.save(dst, "PNG", compress_level=4)
 
 
+def _watermarked_pil(src: Path, user_id: int, key: bytes, reveal_id: str, amp: float) -> Image.Image:
+    rgb = np.array(_load_rgb(src), np.uint8)                              
+    embed_image_array(rgb, user_id, key, reveal_id, amp, inplace=True)
+    return Image.fromarray(rgb)
+
+
 def embed_image(
     src: Path,
     dst: Path,
@@ -787,15 +933,21 @@ def embed_image(
     key: bytes,
     reveal_id: str,
     amp: float = AMP,
-    cell: int = CELL,
+    **_legacy,                                                                     
 ) -> None:
-    del cell
-    rgb = np.asarray(_load_rgb(src), np.uint8)
-    _save_image(
-        Image.fromarray(
-            embed_image_array(rgb, user_id, key, reveal_id, amp)
-        ),
-        dst,
+    _save_image(_watermarked_pil(src, user_id, key, reveal_id, amp), dst)
+
+
+def _write_preview(img: Image.Image, preview: Path, max_dim: int, quality: int) -> None:
+    img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)             
+    preview.parent.mkdir(parents=True, exist_ok=True)
+    img.save(
+        preview,
+        "JPEG",
+        quality=max(70, min(95, int(quality))),
+        optimize=True,
+        progressive=False,
+        subsampling=2,
     )
 
 
@@ -810,129 +962,10 @@ def render_image_preview(
     max_dim: int = 2048,
     quality: int = 88,
 ) -> None:
-    rgb = np.asarray(_load_rgb(src), np.uint8)
-    img = Image.fromarray(
-        embed_image_array(rgb, user_id, key, reveal_id, amp)
-    )
-    del rgb
-
-    img.thumbnail(
-        (max_dim, max_dim),
-        Image.Resampling.LANCZOS,
-    )
-
-    preview.parent.mkdir(parents=True, exist_ok=True)
-
-    img.save(
-        preview,
-        "JPEG",
-        quality=max(70, min(95, int(quality))),
-        optimize=True,
-        progressive=False,
-        subsampling=2,
-    )
+    _write_preview(_watermarked_pil(src, user_id, key, reveal_id, amp), preview, max_dim, quality)
 
 
-def _load_luma(path: Path) -> np.ndarray:
-    """Load one image as compact uint8 luma with an explicit trace-size guard."""
-    with Image.open(path) as im:
-        size = tuple(ImageOps.exif_transpose(im).size)
-        pixels = int(size[0]) * int(size[1])
-        if pixels > TRACE_IMAGE_MAX_PIXELS:
-            raise RuntimeError(
-                f"Image is too large for low-memory tracing ({pixels / 1e6:.1f} MP; "
-                f"limit {TRACE_IMAGE_MAX_PIXELS / 1e6:.1f} MP)."
-            )
-        # PIL's 8-bit luminance is close to the watermark's Y channel and uses
-        # one byte per pixel, avoiding the 4x memory cost of float32 luma.
-        gray = ImageOps.exif_transpose(im).convert("L")
-        return np.array(gray, dtype=np.uint8, copy=True)
-
-
-def extract_image(
-    orig: Path,
-    leak: Path,
-    key: bytes,
-    reveal_id: str,
-    cell: int = CELL,
-    time_budget: float = 30.0,
-) -> dict:
-    """Trace an edited/cropped image with bounded peak memory.
-
-    Only luma is retained at full resolution and only one registered warp is
-    materialized at a time. Registration itself is performed on reduced feature
-    images, so text/icons/grey overlays do not cause several full-size buffers
-    to accumulate.
-    """
-    del cell
-    deadline = time.monotonic() + max(1.0, float(time_budget))
-    oy = _load_luma(orig)
-    leak_y = _load_luma(leak)
-    h, w = oy.shape
-
-    # Identity/resized path is always tested. It is the cheapest case and can
-    # decode immediately when the leak was only recompressed or tone-shifted.
-    base_candidates: list[tuple[np.ndarray, np.ndarray]] = []
-    if leak_y.shape == oy.shape:
-        base_candidates.append((leak_y, np.ones(leak_y.shape, np.uint8)))
-    else:
-        resized = cv2.resize(leak_y, (w, h), interpolation=cv2.INTER_AREA)
-        base_candidates.append((resized, np.ones(oy.shape, np.uint8)))
-
-    if time.monotonic() > deadline:
-        return {"user_id": 0, "metric": 0.0, "ok": False, "valid": False}
-    matrices = _registration_matrices(oy, leak_y)
-    log.info("image extract: %d compact registration matrices", len(matrices))
-
-    # Decode the cheap identity/resized candidate first.
-    variants = _image_trace_variants(h, w)
-    for cand_y, valid in base_candidates:
-        if time.monotonic() > deadline:
-            return {"user_id": 0, "metric": 0.0, "ok": False, "valid": False}
-        uid, metric, ok = _decode_registered(
-            oy, cand_y, key, reveal_id, 0, variants, valid=valid,
-        )
-        if ok:
-            return {"user_id": int(uid), "metric": float(metric), "ok": True, "valid": True}
-
-    # Registered candidates are materialized, tested, and released one at a time.
-    for mat3 in matrices:
-        if time.monotonic() > deadline:
-            break
-        warped, valid = _warp_candidate(leak_y, mat3, (h, w))
-        if TRACE_IMAGE_ECC:
-            warped, valid = _ecc_refine(oy, warped, valid)
-        if valid is not None and np.any(valid < 0.99):
-            valid = cv2.GaussianBlur(valid.astype(np.float32), (0, 0), 0.8)
-            valid[valid < 0.12] = 0.0
-
-        if time.monotonic() > deadline:
-            del warped, valid
-            break
-        uid, metric, ok = _decode_registered(
-            oy, warped, key, reveal_id, 0, variants, valid=valid,
-        )
-        if ok:
-            return {"user_id": int(uid), "metric": float(metric), "ok": True, "valid": True}
-        del warped, valid
-
-    return {"user_id": 0, "metric": 0.0, "ok": False, "valid": False}
-
-def render_image_delivery(
-    src: Path,
-    dst: Path,
-    user_id: int,
-    key: bytes,
-    reveal_id: str,
-    *,
-    amp: float = AMP,
-    target_bytes: Optional[int] = None,
-) -> dict:
-    rgb = np.asarray(_load_rgb(src), np.uint8)
-    watermarked = embed_image_array(rgb, user_id, key, reveal_id, amp)
-    del rgb
-
-    img = Image.fromarray(watermarked, "RGB")
+def _write_delivery(img: Image.Image, dst: Path, target_bytes: Optional[int]) -> dict:
     dst.parent.mkdir(parents=True, exist_ok=True)
 
     qualities = (95, 92, 90, 88, 85, 82, 78)
@@ -991,16 +1024,116 @@ def render_image_delivery(
     raise RuntimeError(
         f"Image could not be encoded below the delivery limit "
         f"({last_size / 1048576:.1f} MiB generated, "
-        f"target {int(target_bytes) / 1048576:.1f} MiB)."
+        f"target {int(target_bytes or 0) / 1048576:.1f} MiB)."
     )
 
 
-# ---------------------------------------------------------------------------
-# Video helpers
-# ---------------------------------------------------------------------------
+def render_image_delivery(
+    src: Path,
+    dst: Path,
+    user_id: int,
+    key: bytes,
+    reveal_id: str,
+    *,
+    amp: float = AMP,
+    target_bytes: Optional[int] = None,
+) -> dict:
+    img = _watermarked_pil(src, user_id, key, reveal_id, amp)
+    return _write_delivery(img, dst, target_bytes)
+
+
+def render_image_both(
+    src: Path,
+    preview: Path,
+    delivery: Path,
+    user_id: int,
+    key: bytes,
+    reveal_id: str,
+    *,
+    amp: float = AMP,
+    max_dim: int = 2048,
+    quality: int = 88,
+    target_bytes: Optional[int] = None,
+) -> dict:
+    """Embed ONCE and write both outputs (use this instead of calling the preview and
+    delivery renderers back to back). Returns the delivery info dict."""
+    img = _watermarked_pil(src, user_id, key, reveal_id, amp)
+    info = _write_delivery(img, delivery, target_bytes)
+    _write_preview(img, preview, max_dim, quality)                                        
+    return info
+
+
+def _load_luma(path: Path) -> np.ndarray:
+    """Load one image as compact uint8 luma. The size guard runs on the header, before decode."""
+    return np.array(_open_oriented(path, "L", TRACE_IMAGE_MAX_PIXELS), dtype=np.uint8)
+
+
+def extract_image(
+    orig: Path,
+    leak: Path,
+    key: bytes,
+    reveal_id: str,
+    time_budget: float = 30.0,
+) -> dict:
+    """Trace an edited/cropped image with bounded peak memory.
+
+    Order: (1) cheap identity / pure-resize decode, (2) feature registration (SIFT/ORB) only
+    if that fails, then one registered warp at a time. Only luma is kept at full resolution."""
+    deadline = time.monotonic() + max(1.0, float(time_budget))
+    oy = _load_luma(orig)
+    leak_y = _load_luma(leak)
+    h, w = oy.shape
+    variants = _image_trace_variants(h, w)
+
+    def ok_result(uid, metric):
+        return {"user_id": int(uid), "metric": float(metric), "ok": True, "valid": True}
+
+                                                                                       
+    base = None
+    if leak_y.shape == oy.shape:
+        base = leak_y
+    elif _aspect_close(leak_y.shape, oy.shape):
+        base = cv2.resize(leak_y, (w, h), interpolation=cv2.INTER_AREA)
+    if base is not None:
+        uid, metric, ok = _decode_registered(oy, base, key, reveal_id, 0, variants, valid=None)
+        if ok:
+            return ok_result(uid, metric)
+        del base
+
+    if time.monotonic() > deadline:
+        return _fail()
+
+                                                                   
+    matrices = _registration_matrices(oy, leak_y)
+    log.info("image extract: %d compact registration matrices", len(matrices))
+
+    for mat3 in matrices:
+        if time.monotonic() > deadline:
+            break
+        warped, valid = _warp_candidate(leak_y, mat3, (h, w))
+        if TRACE_IMAGE_ECC:
+            warped, valid = _ecc_refine(oy, warped, valid)
+        valid = _clean_valid(valid)
+
+        if time.monotonic() > deadline:
+            break
+        uid, metric, ok = _decode_registered(oy, warped, key, reveal_id, 0, variants, valid=valid)
+        del warped, valid
+        if ok:
+            return ok_result(uid, metric)
+
+    return _fail()
+
+
+                                                                             
+               
+                                                                             
 
 def _scale_filter(height: int, flags: str) -> str:
-    return rf"scale=-2:trunc(min(ih\,{int(height)})/2)*2:flags={flags},setsar=1"
+    chosen = os.getenv("VIDEO_SCALE_FILTER", "bicubic").strip().lower() or "bicubic"
+    if chosen not in {"fast_bilinear", "bilinear", "bicubic", "lanczos", "spline", "area"}:
+        chosen = flags
+    return rf"scale=-2:trunc(min(ih\,{int(height)})/2)*2:flags={chosen},setsar=1"
 
 
 def _file_sig(path: Path) -> tuple[str, int, int]:
@@ -1009,16 +1142,11 @@ def _file_sig(path: Path) -> tuple[str, int, int]:
     return str(p), st.st_mtime_ns, st.st_size
 
 
-@lru_cache(maxsize=64)
-def _ffmpeg_info_cached(
-    path: str,
-    mtime_ns: int,
-    size: int,
-) -> str:
+@lru_cache(maxsize=16)
+def _ffmpeg_info_cached(path: str, mtime_ns: int, size: int) -> str:
     del mtime_ns, size
-
     return subprocess.run(
-        [get_ffmpeg(), "-hide_banner", "-i", path],
+        [get_ffmpeg(), "-hide_banner", *_in(path)],
         capture_output=True,
         text=True,
         errors="replace",
@@ -1030,66 +1158,33 @@ def _ffmpeg_info(src: Path) -> str:
     return _ffmpeg_info_cached(*_file_sig(src))
 
 
-@lru_cache(maxsize=64)
-def _probe_video_cached(
-    path: str,
-    mtime_ns: int,
-    size: int,
-    max_height: int,
-):
+@lru_cache(maxsize=16)
+def _probe_video_cached(path: str, mtime_ns: int, size: int, max_height: int):
     info = _ffmpeg_info_cached(path, mtime_ns, size)
 
     fps = None
-
-    for pattern in (
-        r"(\d+(?:\.\d+)?)(?:/(\d+(?:\.\d+))?)?\s*fps",
-        r"(\d+(?:\.\d+)?)\s*tbr",
-    ):
+    for pattern in (r"(\d+(?:\.\d+)?)\s*fps", r"(\d+(?:\.\d+)?)\s*tbr"):
         match = re.search(pattern, info)
-
-        if not match:
-            continue
-
-        numerator = float(match.group(1))
-        denominator = float(match.group(2)) if match.group(2) else 1.0
-
-        if numerator > 0 and denominator > 0:
-            fps = numerator / denominator
+        if match and float(match.group(1)) > 0:
+            fps = float(match.group(1))
             break
 
-    fps = min(max(fps or 30.0, 1.0), 60.0)
-    fps = min(fps, VIDEO_MAX_FPS)
+    fps = min(max(fps or 30.0, 1.0), VIDEO_MAX_FPS)
 
     max_height = max(144, int(max_height))
     vf = f"fps={fps:.6f}," + _scale_filter(max_height, "lanczos")
 
+                                                                                        
     probe = subprocess.run(
-        [
-            get_ffmpeg(),
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            path,
-            "-vf",
-            vf,
-            "-frames:v",
-            "1",
-            "-f",
-            "image2pipe",
-            "-vcodec",
-            "png",
-            "-",
-        ],
+        [*_ff(), *_in(path), "-vf", vf, "-frames:v", "1",
+         "-f", "image2pipe", "-vcodec", "ppm", "-"],
         capture_output=True,
         timeout=45,
     )
 
     if not probe.stdout:
         details = probe.stderr.decode("utf-8", "replace")[-1500:]
-        raise RuntimeError(
-            f"FFmpeg could not decode the video. {details}".strip()
-        )
+        raise RuntimeError(f"FFmpeg could not decode the video. {details}".strip())
 
     with Image.open(io.BytesIO(probe.stdout)) as im:
         w, h = im.size
@@ -1098,18 +1193,11 @@ def _probe_video_cached(
 
 
 def _probe_video(src: Path, max_height: int):
-    return _probe_video_cached(
-        *_file_sig(src),
-        int(max_height),
-    )
+    return _probe_video_cached(*_file_sig(src), int(max_height))
 
 
-def video_info(
-    src: Path,
-    max_height: int = 1080,
-) -> dict:
+def video_info(src: Path, max_height: int = 1080) -> dict:
     w, h, fps, _ = _probe_video(src, max_height)
-
     return {
         "width": w,
         "height": h,
@@ -1133,49 +1221,21 @@ def _read_full(stream, buf) -> bool:
     return True
 
 
-def _frame_nbytes(w: int, h: int, pix_fmt: str) -> int:
-    if pix_fmt == "rgb24":
-        return w * h * 3
-    if pix_fmt == "gray":
-        return w * h
-    return w * h * 3 // 2
-
-
 def _iter_frames(
     src: Path,
     vf: str,
     w: int,
     h: int,
     *,
-    skip: int = 0,
-    limit: Optional[int] = None,
     max_seconds: Optional[int] = None,
-    pix_fmt: str = "yuv420p",
 ) -> Iterator[tuple[int, bytearray]]:
-    size = _frame_nbytes(w, h, pix_fmt)
+    """Yield (index, yuv420p buffer). The SAME bytearray is reused for every frame."""
+    size = w * h * 3 // 2
 
-    cmd = [
-        get_ffmpeg(),
-        "-hide_banner",
-        "-loglevel",
-        "error",
-    ]
-
+    cmd = _ff()
     if max_seconds:
         cmd += ["-t", str(max_seconds)]
-
-    cmd += [
-        "-i",
-        str(src),
-        "-an",
-        "-vf",
-        vf,
-        "-f",
-        "rawvideo",
-        "-pix_fmt",
-        pix_fmt,
-        "-",
-    ]
+    cmd += [*_in(src), "-an", "-vf", vf, "-f", "rawvideo", "-pix_fmt", "yuv420p", "-"]
 
     proc = subprocess.Popen(
         cmd,
@@ -1188,13 +1248,8 @@ def _iter_frames(
     idx = 0
 
     try:
-        while limit is None or idx - skip < limit:
-            if not _read_full(proc.stdout, buf):
-                break
-
-            if idx >= skip:
-                yield idx, buf
-
+        while _read_full(proc.stdout, buf):
+            yield idx, buf
             idx += 1
     finally:
         proc.kill()
@@ -1218,17 +1273,27 @@ def _video_duration_seconds(src: Path) -> float:
     )
 
 
+_PRESETS = ("ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow")
+
+
 def _choose_video_preset(preset: str, duration: float) -> str:
     requested = (preset or "").strip().lower()
-    if requested in {"fast", "medium", "slow", "slower", "veryslow"}:
-        return requested
-    if requested not in {"", "auto"}:
-        return "fast"
-    if duration >= 180:
-        return "slow"
-    if duration >= 90:
-        return "medium"
-    return "fast"
+    if requested in _PRESETS:
+        chosen = requested
+    elif requested not in {"", "auto"}:
+        chosen = "fast"
+    elif duration >= 180:
+        chosen = "slow"
+    elif duration >= 90:
+        chosen = "medium"
+    else:
+        chosen = "fast"
+
+                                                                        
+    cap = os.getenv("VIDEO_PRESET_MAX", "").strip().lower()
+    if cap in _PRESETS and _PRESETS.index(chosen) > _PRESETS.index(cap):
+        chosen = cap
+    return chosen
 
 
 def _adaptive_video_shape(
@@ -1242,6 +1307,19 @@ def _adaptive_video_shape(
 ) -> tuple[int, float]:
     ceiling = max(144, min(int(source_height), int(requested_max)))
     source_fps = max(1.0, min(float(source_fps), 30.0))
+
+                                                                              
+                                                                             
+                                                                                
+                                                                              
+                                                    
+    long_seconds = max(0.0, float(os.getenv("VIDEO_LONG_PROFILE_SECONDS", "90")))
+    if long_seconds and duration >= long_seconds:
+        long_height = max(360, int(os.getenv("VIDEO_LONG_PROFILE_HEIGHT", "540")))
+        long_fps = max(12.0, min(24.0, float(os.getenv("VIDEO_LONG_PROFILE_FPS", "20"))))
+        ceiling = min(ceiling, long_height)
+        source_fps = min(source_fps, long_fps)
+
     if not target_bytes or duration <= 0 or ceiling <= 360:
         return ceiling, source_fps
 
@@ -1253,13 +1331,13 @@ def _adaptive_video_shape(
     bpp_floor = 0.022
 
     fps_candidates = [source_fps]
-    for f in (30.0, 27.0, 24.0, 20.0, 18.0, 15.0, 12.0):
+    for f in VIDEO_FPS_HYPOTHESES:
         f = min(source_fps, f)
         if f >= 1.0:
             fps_candidates.append(round(f, 3))
     fps_candidates = sorted(set(fps_candidates), reverse=True)
 
-    for candidate_h in (1080, 900, 720, 648, 576, 540, 480, 360):
+    for candidate_h in HEIGHT_LADDER:
         if candidate_h > ceiling:
             continue
         candidate_w = max(2, round(source_width * candidate_h / max(source_height, 1)))
@@ -1339,19 +1417,17 @@ def embed_video(
     reveal_id: str,
     *,
     amp: float = AMP,
-    cell: int = CELL,
     preset: str = "fast",
     max_seconds: int = 300,
     max_height: int = 1080,
     group: int = VIDEO_GROUP,
     target_bytes: Optional[int] = None,
     audio_kbps: int = 96,
-    max_bpp: float = MAX_BITS_PER_PIXEL,
+    **_legacy,                                                                                    
 ) -> dict:
     """Returns the delivery profile. STORE `height` and `fps` (and width) per reveal and pass
     them back to `extract(..., delivery_height=..., delivery_fps=...)`: the watermark layout is
     derived from the delivered frame size, so tracing needs the reference rendered at that size."""
-    del cell, max_bpp
     duration = min(float(max_seconds), max(0.0, _video_duration_seconds(src)))
     if duration <= 0:
         duration = float(max_seconds)
@@ -1376,6 +1452,11 @@ def embed_video(
     last_size = 0
     last_profile = None
 
+    base_cap: Optional[int] = None
+    if USE_VBV_CAP and target:
+        bits_left = target * 8.0 * 0.95 - audio_bps * duration
+        base_cap = max(MIN_VIDEO_BPS, int(bits_left / max(duration, 1.0)))
+
     def encode_once(
         out_path: Path,
         w: int,
@@ -1383,6 +1464,7 @@ def embed_video(
         fps: float,
         crf: Optional[float] = None,
         video_bitrate: Optional[int] = None,
+        maxrate: Optional[int] = None,
     ) -> int:
         vf = f"fps={fps:.6f}," + _scale_filter(h, "lanczos")
         if video_bitrate is not None:
@@ -1395,14 +1477,17 @@ def embed_video(
             if crf is None:
                 raise ValueError("Either crf or video_bitrate must be supplied")
             rate_args = ["-crf", f"{float(crf):.2f}"]
+            if maxrate:
+                rate_args += ["-maxrate", str(int(maxrate)), "-bufsize", str(int(maxrate) * 2)]
         gop = max(1, min(120, int(round(fps * 2.0))))
         err = tempfile.TemporaryFile()
         enc = subprocess.Popen(
             [
-                get_ffmpeg(), "-hide_banner", "-loglevel", "error", "-y",
+                *_ff(), "-y",
+                "-threads", str(FFMPEG_THREADS), "-protocol_whitelist", "pipe,fd",
                 "-f", "rawvideo", "-pix_fmt", "yuv420p",
                 "-s", f"{w}x{h}", "-framerate", f"{fps:.6f}", "-i", "-",
-                "-t", f"{duration:.3f}", "-i", str(src),
+                "-t", f"{duration:.3f}", *_in(src),
                 "-map", "0:v:0", "-map", "1:a:0?",
                 "-c:v", "libx264", "-preset", selected_preset,
                 *rate_args,
@@ -1411,6 +1496,7 @@ def embed_video(
                 "-x264-params", "aq-mode=1:aq-strength=0.9:open-gop=0",
                 "-tag:v", "avc1",
                 "-c:a", "aac", "-b:a", str(audio_bps), "-ar", "48000", "-ac", "2",
+                "-threads", str(FFMPEG_THREADS),
                 "-map_metadata", "-1", "-map_chapters", "-1", "-sn", "-dn",
                 "-avoid_negative_ts", "make_zero", "-movflags", "+faststart",
                 "-t", f"{duration:.3f}", str(out_path),
@@ -1423,30 +1509,29 @@ def embed_video(
         frames = 0
         cached_group = -1
         add_plane = sub_plane = None
+        rc = -1
         try:
-            for i, buf in _iter_frames(src, vf, w, h, max_seconds=max_seconds):
-                source_frame_idx = int(
-                    round(
-                        i * source_fps / max(float(fps), 1e-6)
-                    )
-                )
-                group_idx = source_frame_idx // max(1, int(group))
+            with closing(_iter_frames(src, vf, w, h, max_seconds=max_seconds)) as it:
+                for i, buf in it:
+                    source_frame_idx = int(round(i * source_fps / max(float(fps), 1e-6)))
+                    group_idx = source_frame_idx // max(1, int(group))
 
-                frame = bytearray(buf)
-                y = np.frombuffer(frame, np.uint8, count=w * h).reshape(h, w)
+                    y = np.frombuffer(buf, np.uint8, count=w * h).reshape(h, w)
 
-                if group_idx != cached_group:
-                    add_plane, sub_plane = _delta_planes(
-                        y, bits, key, reveal_id, group_idx, amp
-                    )
-                    cached_group = group_idx
+                    if group_idx != cached_group:
+                        add_plane, sub_plane = _delta_planes(
+                            y, bits, key, reveal_id, group_idx, amp
+                        )
+                        cached_group = group_idx
 
-                y[:, :] = cv2.subtract(cv2.add(y, add_plane), sub_plane)
-                try:
-                    enc.stdin.write(frame)
-                except BrokenPipeError:
-                    break
-                frames += 1
+                                                                                             
+                    cv2.add(y, add_plane, dst=y)
+                    cv2.subtract(y, sub_plane, dst=y)
+                    try:
+                        enc.stdin.write(buf)
+                    except BrokenPipeError:
+                        break
+                    frames += 1
 
             try:
                 enc.stdin.close()
@@ -1454,11 +1539,13 @@ def embed_video(
                 pass
             rc = enc.wait(timeout=max(120, int(duration * 8)))
         except subprocess.TimeoutExpired as exc:
-            enc.kill(); enc.wait()
+            enc.kill()
+            enc.wait()
             raise RuntimeError("FFmpeg video encode timed out.") from exc
         finally:
             if enc.poll() is None:
-                enc.kill(); enc.wait()
+                enc.kill()
+                enc.wait()
             err.seek(0)
             error_text = err.read().decode("utf-8", "replace")[-4000:]
             err.close()
@@ -1470,13 +1557,13 @@ def embed_video(
         return frames
 
     height_candidates = [delivery_height]
-    for candidate in (1080, 900, 720, 648, 576, 540, 480, 360):
+    for candidate in HEIGHT_LADDER:
         if candidate < delivery_height and candidate <= source_h and candidate <= max_height:
             height_candidates.append(candidate)
     height_candidates = list(dict.fromkeys(height_candidates))[:4]
 
     for profile_no, height in enumerate(height_candidates, 1):
-        _, h0, probed_fps, _ = _probe_video(src, int(height))
+        w, h, probed_fps, _ = _probe_video(src, int(height))
         base_fps = min(float(probed_fps), float(delivery_fps), 30.0)
         if profile_no > 1:
             base_fps = min(base_fps, 24.0 if height <= 720 else 27.0)
@@ -1489,7 +1576,6 @@ def embed_video(
         fps_candidates = list(dict.fromkeys(fps_candidates))
 
         for fps in fps_candidates:
-            w, h, _, _ = _probe_video(src, int(height))
             crf = _quality_crf(
                 width=w, height=h, fps=fps, target=target, duration=duration
             )
@@ -1498,8 +1584,9 @@ def embed_video(
                 tmp_out = dst.with_name(
                     f"{dst.stem}.p{profile_no}_{int(round(fps))}_{attempt}.tmp{dst.suffix}"
                 )
+                cap = int(base_cap * (0.93 ** attempt)) if base_cap else None
                 try:
-                    encode_once(tmp_out, w, h, fps, crf=crf)
+                    encode_once(tmp_out, w, h, fps, crf=crf, maxrate=cap)
                     last_size = tmp_out.stat().st_size
                     last_profile = (w, h, fps, crf)
                     if not target or last_size <= target:
@@ -1524,17 +1611,9 @@ def embed_video(
 
         for rescue_no, scale in enumerate((1.0, 0.82), 1):
             rescue_rate = max(MIN_VIDEO_BPS, int(rescue_bps * scale))
-            tmp_out = dst.with_name(
-                f"{dst.stem}.rescue{rescue_no}.tmp{dst.suffix}"
-            )
+            tmp_out = dst.with_name(f"{dst.stem}.rescue{rescue_no}.tmp{dst.suffix}")
             try:
-                encode_once(
-                    tmp_out,
-                    w,
-                    h,
-                    fps,
-                    video_bitrate=rescue_rate,
-                )
+                encode_once(tmp_out, w, h, fps, video_bitrate=rescue_rate)
                 last_size = tmp_out.stat().st_size
                 if last_size <= target:
                     tmp_out.replace(dst)
@@ -1555,15 +1634,13 @@ def embed_video(
         f"last profile {last_profile}, last size {last_size / 1048576:.1f} MiB"
         if last_profile else "no successful encode"
     )
-    raise RuntimeError(
-        "Video could not be encoded below the delivery limit "
-        f"({profile_text}, target {target / 1048576:.1f} MiB)." if target else f"({profile_text})."
-    )
+    limit_text = f", target {target / 1048576:.1f} MiB" if target else ""
+    raise RuntimeError(f"Video could not be encoded below the delivery limit ({profile_text}{limit_text}).")
 
 
-# ---------------------------------------------------------------------------
-# Video tracing
-# ---------------------------------------------------------------------------
+                                                                             
+               
+                                                                             
 
 def _visual_signature(gray: np.ndarray, width: int = 48, height: int = 27) -> np.ndarray:
     small = cv2.resize(gray, (width, height), interpolation=cv2.INTER_AREA).astype(np.float32)
@@ -1574,29 +1651,24 @@ def _visual_signature(gray: np.ndarray, width: int = 48, height: int = 27) -> np
     return small
 
 
-def _sift_descriptors(gray: np.ndarray, nfeatures: int = 300, max_dim: int = COARSE_FEATURE_DIM):
+def _sift_descriptors(gray: np.ndarray, sift, max_dim: int = COARSE_FEATURE_DIM):
     small, _ = _feature_image(gray, max_dim)
-    sift = cv2.SIFT_create(nfeatures=nfeatures, contrastThreshold=0.04, edgeThreshold=10)
     return sift.detectAndCompute(small, None)
 
 
-def _sift_match_count(query_desc: np.ndarray | None, frame_desc: np.ndarray | None) -> float:
+def _sift_match_count(matcher, query_desc: np.ndarray | None, frame_desc: np.ndarray | None) -> float:
     if query_desc is None or frame_desc is None or len(query_desc) < 5 or len(frame_desc) < 8:
         return 0.0
     try:
-        matches = cv2.BFMatcher(cv2.NORM_L2).knnMatch(query_desc, frame_desc, k=2)
+        matches = matcher.knnMatch(query_desc, frame_desc, k=2)
     except cv2.error:
         return 0.0
     return float(sum(1 for m in matches if len(m) == 2 and m[0].distance < 0.78 * m[1].distance))
 
 
 def _height_ladder(orig: Path, max_height: int) -> list[int]:
-    """Candidate delivery heights to try when the stored profile is unknown.
-
-    Probe once at the requested ceiling instead of launching FFmpeg once per
-    ladder entry. The actual delivered height is still validated when a window
-    is decoded, while unknown-profile tracing avoids redundant probes.
-    """
+    """Candidate delivery heights to try when the stored profile is unknown. Probes once
+    at the requested ceiling; the real height is validated when a window is decoded."""
     ceiling = max(144, int(max_height))
     try:
         _, actual_h, _, _ = _probe_video(orig, ceiling)
@@ -1609,7 +1681,9 @@ def _height_ladder(orig: Path, max_height: int) -> list[int]:
 
     out: list[int] = []
     seen: set[int] = set()
-    for c in (ceiling, *HEIGHT_LADDER):
+                                                                                     
+                                                                                        
+    for c in (ceiling, 720, 540, 480):
         c = int(c)
         if c > ceiling or c < 144:
             continue
@@ -1638,22 +1712,28 @@ def _coarse_rank(
     coarse_fps = min(COARSE_FPS, max(1.0, float(source_fps)))
     vf = f"fps={coarse_fps:.6f}," + _scale_filter(coarse_h, "fast_bilinear")
 
+    sift_q = cv2.SIFT_create(nfeatures=800, contrastThreshold=0.04, edgeThreshold=10)
+    sift_f = cv2.SIFT_create(nfeatures=300, contrastThreshold=0.04, edgeThreshold=10)
+    matcher = cv2.BFMatcher(cv2.NORM_L2)
+
     q_gray = [_to_gray(q) for q in queries]
     q_sig = [_visual_signature(g) for g in q_gray]
-    q_desc = [_sift_descriptors(g, nfeatures=800)[1] for g in q_gray]
+    q_desc = [_sift_descriptors(g, sift_q)[1] for g in q_gray]
+    del q_gray
     ranked: list[list[tuple[float, int]]] = [[] for _ in queries]
 
-    for idx, buf in _iter_frames(orig, vf, w, h, max_seconds=max_seconds):
-        if deadline is not None and time.monotonic() > deadline:
-            log.info("coarse search stopped by time budget at frame %d", idx)
-            break
-        gray = np.frombuffer(buf, np.uint8, count=w * h).reshape(h, w)
-        sig = _visual_signature(gray)
-        desc = _sift_descriptors(gray)[1]
-        for n in range(len(queries)):
-            sift = _sift_match_count(q_desc[n], desc)
-            diff = float(np.mean(np.abs(sig - q_sig[n])))
-            ranked[n].append((-sift + 100.0 * diff, idx))
+    with closing(_iter_frames(orig, vf, w, h, max_seconds=max_seconds)) as frames:
+        for idx, buf in frames:
+            if deadline is not None and time.monotonic() > deadline:
+                log.info("coarse search stopped by time budget at frame %d", idx)
+                break
+            gray = np.frombuffer(buf, np.uint8, count=w * h).reshape(h, w)
+            sig = _visual_signature(gray)
+            desc = _sift_descriptors(gray, sift_f)[1]
+            for n in range(len(queries)):
+                sift = _sift_match_count(matcher, q_desc[n], desc)
+                diff = float(np.mean(np.abs(sig - q_sig[n])))
+                ranked[n].append((-sift + 100.0 * diff, idx))
 
     out: list[list[float]] = []
     for scored in ranked:
@@ -1669,16 +1749,6 @@ def _coarse_rank(
     return out
 
 
-def _coarse_hits(
-    orig: Path,
-    leak_rgb: np.ndarray,
-    max_height: int,
-    max_seconds: int = 300,
-    top_k: int = 5,
-) -> list[float]:
-    return _coarse_rank(orig, [leak_rgb], max_height, max_seconds=max_seconds, top_k=top_k)[0]
-
-
 def _ncc(a: np.ndarray, b: np.ndarray, m: np.ndarray) -> float:
     a = cv2.GaussianBlur(a, (0, 0), 1.0)
     b = cv2.GaussianBlur(b, (0, 0), 1.0)
@@ -1690,52 +1760,93 @@ def _ncc(a: np.ndarray, b: np.ndarray, m: np.ndarray) -> float:
     return float((x * y).sum() / (np.linalg.norm(x) * np.linalg.norm(y) + 1e-6))
 
 
-def _read_window(
+def _iter_window(
     orig: Path,
-    center: float,
-    height: int,
-    half: float,
-) -> tuple[int, int, float, list[tuple[int, np.ndarray]], Optional[np.ndarray]]:
-    """Decodes ~2*half seconds of the source around `center` at the delivery height.
-    Returns (w, h, fps, [(frame_idx, luma_uint8)], middle_frame_rgb)."""
-    w, h, fps, _ = _probe_video(orig, height)
-    t0 = max(0.0, float(center) - half)
-    span = 2.0 * half
+    t0: float,
+    span: float,
+    w: int,
+    h: int,
+    fps: float,
+) -> Iterator[tuple[int, np.ndarray]]:
+    """Stream the RGB frames of [t0, t0+span] at the delivery size. The yielded array is a
+    view of ONE reused buffer: copy anything you want to keep."""
     vf = f"fps={fps:.6f}," + _scale_filter(h, "lanczos")
     cmd = [
-        get_ffmpeg(), "-hide_banner", "-loglevel", "error",
-        "-ss", f"{t0:.3f}", "-i", str(orig), "-t", f"{span:.3f}",
+        *_ff(), "-ss", f"{t0:.3f}", *_in(orig), "-t", f"{span:.3f}",
         "-an", "-vf", vf, "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
     ]
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=w * h * 3 * 2,
     )
     buf = bytearray(w * h * 3)
-    base = int(round(t0 * fps))
-    mid_k = int(span * fps / 2.0)
-    frames: list[tuple[int, np.ndarray]] = []
-    mid_rgb: Optional[np.ndarray] = None
-    k = 0
     t_end = time.monotonic() + WINDOW_READ_TIMEOUT
+    k = 0
     try:
         while _read_full(proc.stdout, buf):
-            rgb = np.frombuffer(buf, np.uint8).reshape(h, w, 3)
-            y = np.clip(np.rint(rgb @ RGB2Y), 0, 255).astype(np.uint8)
-            frames.append((base + k, y))
-            if k == mid_k:
-                mid_rgb = rgb.copy()
+            yield k, np.frombuffer(buf, np.uint8).reshape(h, w, 3)
             k += 1
             if time.monotonic() > t_end:
-                log.warning("window read timed out at t=%.2f", center)
+                log.warning("window read timed out at t0=%.2f", t0)
                 break
     finally:
         proc.kill()
         proc.wait()
         proc.stdout.close()
 
-    if frames and mid_rgb is None:
-        mid_rgb = cv2.cvtColor(frames[len(frames) // 2][1], cv2.COLOR_GRAY2RGB)
-    return w, h, fps, frames, mid_rgb
+
+def _scan_window(orig: Path, center: float, height: int, half: float):
+    """Pass 1: stream the window keeping only small gray thumbnails (for NCC ranking) and the
+    middle RGB frame (for registration). Memory is a few MB instead of ~190 MB at 1080p.
+    Returns (w, h, fps, [(frame_idx, thumb_uint8)], mid_rgb, t0)."""
+    w, h, fps, _ = _probe_video(orig, height)
+    t0 = max(0.0, float(center) - half)
+    span = 2.0 * half
+    base = int(round(t0 * fps))
+    mid_k = int(span * fps / 2.0)
+    sh = max(64, min(h, 270))
+    sw = max(64, int(round(w * sh / h)))
+
+    thumbs: list[tuple[int, np.ndarray]] = []
+    mid_rgb: Optional[np.ndarray] = None
+    with closing(_iter_window(orig, t0, span, w, h, fps)) as frames:
+        for k, rgb in frames:
+            gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+            thumbs.append((base + k, cv2.resize(gray, (sw, sh), interpolation=cv2.INTER_AREA)))
+            if k == mid_k:
+                mid_rgb = rgb.copy()
+
+    if thumbs and mid_rgb is None:                                                        
+        want = base + len(thumbs) // 2
+        mid_rgb = _collect_window(orig, t0, span, w, h, fps, {want}, rgb=True).get(want)
+    return w, h, fps, thumbs, mid_rgb, t0
+
+
+def _collect_window(
+    orig: Path,
+    t0: float,
+    span: float,
+    w: int,
+    h: int,
+    fps: float,
+    want: set[int],
+    *,
+    rgb: bool = False,
+) -> dict[int, np.ndarray]:
+    """Pass 2: decode the window again but keep only the requested frame indices
+    (full-res uint8 luma, or RGB). Stops as soon as all of them are collected."""
+    base = int(round(t0 * fps))
+    last = max(want)
+    out: dict[int, np.ndarray] = {}
+    with closing(_iter_window(orig, t0, span, w, h, fps)) as frames:
+        for k, frame in frames:
+            idx = base + k
+            if idx in want:
+                out[idx] = frame.copy() if rgb else cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+                if len(out) == len(want):
+                    break
+            elif idx > last:
+                break
+    return out
 
 
 def _decode_window(
@@ -1753,36 +1864,36 @@ def _decode_window(
     came from by NCC, then decode against those frames. Scores from several frames are
     accumulated if no single frame decodes on its own."""
     try:
-        w, h, fps, frames, mid_rgb = _read_window(orig, center, height, half)
+        w, h, fps, thumbs, mid_rgb, t0 = _scan_window(orig, center, height, half)
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
         log.warning("window read failed at t=%.2f h=%d: %s", center, height, exc)
         return None
-    if not frames or mid_rgb is None:
+    if not thumbs or mid_rgb is None:
         log.info("no frames at t=%.2f h=%d", center, height)
         return None
 
-    sh = max(64, min(h, 270))
-    sw = max(64, int(round(w * sh / h)))
-    small_frames = [
-        (idx, cv2.resize(y, (sw, sh), interpolation=cv2.INTER_AREA).astype(np.float32))
-        for idx, y in frames
-    ]
-    frame_lookup = {idx: y for idx, y in frames}
+    sh, sw = thumbs[0][1].shape
 
-    # Registration against the middle frame (the geometry is the same for all frames).
+                                                                                      
+                                                                           
     best = None
-    for cand, valid in _registration_candidates(mid_rgb, leak_rgb):
+    for cand, valid in _iter_registration_candidates(mid_rgb, leak_rgb):
         if cand.shape[:2] != (h, w):
             continue
-        cy = cand.astype(np.float32) @ RGB2Y
+        cy = cv2.cvtColor(cand.astype(np.float32), cv2.COLOR_RGB2GRAY)
+        del cand
         cy_s = cv2.resize(cy, (sw, sh), interpolation=cv2.INTER_AREA)
-        v_s = cv2.resize(valid.astype(np.float32), (sw, sh), interpolation=cv2.INTER_AREA)
+        if valid is None:
+            v_s = np.ones((sh, sw), np.float32)
+        else:
+            v_s = cv2.resize(valid.astype(np.float32, copy=False), (sw, sh), interpolation=cv2.INTER_AREA)
         scored = sorted(
-            ((_ncc(f, cy_s, v_s), idx) for idx, f in small_frames),
+            ((_ncc(f.astype(np.float32), cy_s, v_s), idx) for idx, f in thumbs),
             key=lambda t: -t[0],
         )
         if best is None or scored[0][0] > best[0]:
             best = (scored[0][0], scored[:top], cy, valid)
+    del mid_rgb, thumbs
 
     if best is None:
         log.info("no registration candidate at t=%.2f h=%d", center, height)
@@ -1792,22 +1903,27 @@ def _decode_window(
         log.info("low NCC %.3f at t=%.2f h=%d", top_ncc, center, height)
         return None
 
+                                                              
+    luma = _collect_window(orig, t0, 2.0 * half, w, h, fps, {idx for _, idx in ranked})
+
     variants = _geometry_variants(h, w)
     zero = [(0.0, 0.0, 0.0, 0.0, 0.0)]
     total = np.zeros(N_BITS, np.float64)
     accumulated = 0
 
     for _, idx in ranked:
-        oy = frame_lookup[idx].astype(np.float32)
+        if idx not in luma:
+            continue
+        oy = luma[idx].astype(np.float32)
         groups = _group_hypotheses(idx, fps, leak_fps)
-        # Pick the chip group(s) cheaply at identity, then search geometry for those only.
+                                                                                          
         group_rank = sorted(
             (
                 (_top_scores(oy, cy, key, reveal_id, g, zero, valid, keep=1)[0][0], g)
                 for g in groups
             ),
             reverse=True,
-        )[:2]
+        )[:4]
 
         frame_best = None
         for _, g in group_rank:
@@ -1850,17 +1966,21 @@ def _try_times(
     deadline: float,
     tried: list[float],
 ) -> Optional[dict]:
-    for t in times:
-        if any(abs(t - x) < 0.75 for x in tried):
-            continue
-        tried.append(t)
-        for height in heights:
-            if time.monotonic() > deadline:
-                log.info("time budget exhausted")
-                return None
-            hit = _decode_window(orig, leak_rgb, t, key, reveal_id, height, group_fps)
-            if hit is not None:
-                return hit
+                                                                                     
+                                                                                 
+    for base_t in times:
+        for delta in (0.0, -0.25, 0.25, -0.50, 0.50):
+            t = max(0.0, float(base_t) + delta)
+            if any(abs(t - x) < 0.20 for x in tried):
+                continue
+            tried.append(t)
+            for height in heights:
+                if time.monotonic() > deadline:
+                    log.info("time budget exhausted")
+                    return None
+                hit = _decode_window(orig, leak_rgb, t, key, reveal_id, height, group_fps)
+                if hit is not None:
+                    return hit
     return None
 
 
@@ -1893,12 +2013,8 @@ def _sample_leak_video(
     max_height: int,
     count: int = 5,
 ) -> tuple[list[tuple[int, np.ndarray]], float]:
-    """Samples evenly spaced RGB frames without decoding the whole leak.
-
-    Random-access seeks are used because the old implementation decoded from
-    frame zero until the last requested sample. Long leaked clips therefore
-    paid almost the entire decode cost before tracing could begin.
-    """
+    """Samples evenly spaced RGB frames using random-access seeks, so long leaked clips
+    are not decoded from frame zero."""
     w, h, fps, _ = _probe_video(leak, max_height)
     duration = _video_duration_seconds(leak)
     count = max(1, min(int(count), TRACE_MAX_SAMPLES))
@@ -1912,16 +2028,12 @@ def _sample_leak_video(
 
     for t in times:
         cmd = [
-            get_ffmpeg(),
-            "-hide_banner", "-loglevel", "error",
+            *_ff(),
             "-ss", f"{max(0.0, float(t)):.3f}",
-            "-i", str(leak),
-            "-an",
-            "-frames:v", "1",
+            *_in(leak),
+            "-an", "-frames:v", "1",
             "-vf", vf,
-            "-f", "rawvideo",
-            "-pix_fmt", "rgb24",
-            "-",
+            "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
         ]
         try:
             proc = subprocess.run(
@@ -1934,7 +2046,7 @@ def _sample_leak_video(
         if proc.returncode != 0 or len(proc.stdout) < frame_size:
             continue
 
-        rgb = np.frombuffer(proc.stdout[:frame_size], np.uint8).reshape(h, w, 3).copy()
+        rgb = np.frombuffer(proc.stdout, np.uint8, count=frame_size).reshape(h, w, 3).copy()
         out.append((int(round(float(t) * max(fps, 1.0))), rgb))
 
     return out, fps
@@ -1946,7 +2058,6 @@ def extract_video_frame(
     key: bytes,
     reveal_id: str,
     *,
-    cell: int = CELL,
     max_height: int = 1080,
     start_frame: int = 0,
     heights: Optional[list[int]] = None,
@@ -1954,9 +2065,8 @@ def extract_video_frame(
     time_budget: float = DEFAULT_TIME_BUDGET,
 ) -> dict:
     """Trace a single screenshot/crop taken from a delivered video."""
-    del cell
     deadline = time.monotonic() + float(time_budget)
-    leak_rgb = np.asarray(_load_rgb(leak), np.uint8)
+    leak_rgb = np.asarray(_load_rgb(leak, TRACE_IMAGE_MAX_PIXELS), np.uint8)
     heights = list(heights) if heights else _height_ladder(orig, max_height)
     source_fps = _probe_video(orig, max_height)[2]
 
@@ -2021,14 +2131,14 @@ def extract_video(
         leak_duration = _video_duration_seconds(leak)
         ratio = source_duration / leak_duration if leak_duration > 0 and source_duration > 0 else 1.0
 
-        # 1) cheap: assume the leak is the whole clip, scaled in time
+                                                                     
         for leak_idx, rgb in picks:
             t = max(0.0, float(leak_idx) / max(leak_fps, 1.0) * ratio)
             hit = _try_times(orig, rgb, [t], heights, key, reveal_id, group_fps, deadline, tried)
             if hit is not None:
                 break
 
-        # 2) feature search over the source, one pass for all probe frames
+                                                                          
         if hit is None:
             chosen = picks[:3]
             ranked_times = _coarse_rank(orig, [rgb for _, rgb in chosen], max_height, deadline=deadline)
@@ -2037,9 +2147,9 @@ def extract_video(
                 if hit is not None:
                     break
 
-        # 3) brute-force sweep
+                              
         if hit is None:
-            hit = _scan_fallback(orig, picks[0][1], heights, key, reveal_id, group_fps, deadline, tried)
+            hit = _scan_fallback(orig, picks[len(picks) // 2][1], heights, key, reveal_id, group_fps, deadline, tried)
 
     if hit is None:
         return _fail(frame=0, time=0.0)
@@ -2050,10 +2160,6 @@ def extract_video(
     }
 
 
-def _fail(**extra) -> dict:
-    return {"user_id": 0, "metric": 0.0, "ok": False, "valid": False, **extra}
-
-
 def extract(
     orig: Path,
     leak: Path,
@@ -2061,33 +2167,32 @@ def extract(
     key: bytes,
     reveal_id: str,
     *,
-    image_cell: int = CELL,
-    video_cell: int = CELL,
     max_height: int = 1080,
     start_frame: int = 0,
     delivery_height: Optional[int] = None,
     delivery_fps: Optional[float] = None,
     time_budget: float = DEFAULT_TIME_BUDGET,
+    **_legacy,                                                                                
 ) -> dict:
     """`delivery_height` / `delivery_fps` are the `height` / `fps` returned by embed_video for
     this reveal. Pass them whenever you have them: the watermark layout depends on the
-    delivered frame size. Without them every height in HEIGHT_LADDER is tried (slow)."""
+    delivered frame size. Without them every height in HEIGHT_LADDER is tried (slow).
+
+    A positive result only says "the payload CRC matched". Before naming anyone, confirm that
+    the returned user_id actually received this reveal_id in your database."""
     heights: Optional[list[int]] = None
     if kind in ("video", "video_frame") and delivery_height:
         max_height = int(delivery_height)
         heights = [max_height]
 
     if kind == "image":
-        res = extract_image(
-            orig, leak, key, reveal_id, image_cell, time_budget=time_budget
-        )
+        res = extract_image(orig, leak, key, reveal_id, time_budget=time_budget)
     elif kind == "video_frame":
         res = extract_video_frame(
             orig,
             leak,
             key,
             reveal_id,
-            cell=video_cell,
             max_height=max_height,
             start_frame=start_frame,
             heights=heights,
