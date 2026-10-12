@@ -346,38 +346,7 @@ def _get_reveal_restore_lock(reveal_id: str) -> asyncio.Lock:
                 
                                                                              
 
-_WORKER_SRC = r'''
-import json, sys
-from pathlib import Path
-import watermark as wm
-
-def main():
-    req = json.loads(sys.stdin.read())
-    op, key, a = req["op"], bytes.fromhex(req["key"]), req["args"]
-    if op == "image":
-        res = wm.render_image_delivery(
-            Path(a["src"]), Path(a["dst"]), a["user_id"], key, a["reveal_id"],
-            amp=a["amp"], target_bytes=a["target_bytes"])
-    elif op == "video":
-        res = wm.embed_video(
-            Path(a["src"]), Path(a["dst"]), a["user_id"], key, a["reveal_id"],
-            amp=a["amp"], preset=a["preset"], max_seconds=a["max_seconds"],
-            max_height=a["max_height"], target_bytes=a["target_bytes"],
-            audio_kbps=a["audio_kbps"])
-    elif op == "extract":
-        res = wm.extract(
-            Path(a["orig"]), Path(a["leak"]), a["kind"], key, a["reveal_id"], **a["kwargs"])
-    elif op == "image_check":
-        w, h = wm._load_rgb(Path(a["path"])).size
-        res = {"width": w, "height": h}
-    elif op == "video_info":
-        res = wm.video_info(Path(a["path"]), a["max_height"])
-    else:
-        raise ValueError("unknown op " + str(op))
-    sys.stdout.write("\n" + json.dumps(res) + "\n")
-
-main()
-'''
+_WORKER_SCRIPT = BASE_DIR / "worker.py"
 
 _WORKER_ENV = {
     **{k: v for k, v in os.environ.items() if k not in {"DISCORD_TOKEN", "WATERMARK_SECRET"}},
@@ -403,7 +372,7 @@ def _kill_group(proc) -> None:
 async def run_worker(op: str, timeout: float, **args) -> dict:
     payload = json.dumps({"op": op, "key": WM_KEY.hex(), "args": args}).encode()
     proc = await asyncio.create_subprocess_exec(
-        sys.executable, "-c", _WORKER_SRC,
+        sys.executable, str(_WORKER_SCRIPT),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
